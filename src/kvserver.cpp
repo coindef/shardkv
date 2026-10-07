@@ -11,12 +11,15 @@
 #include <csignal>
 #include <cstdio>
 #include <memory>
+#include <system_error>
 #include <thread>
 
 #include "store.h"
 
 static volatile sig_atomic_t g_stop = 0;
 constexpr size_t kMaxRequest = 64 << 20;  // caps bytes buffered for one unfinished command
+constexpr size_t kFlushAt = 64 << 10;     // send pipelined replies once this many pile up
+constexpr int kSendTimeoutSec = 10;       // drop a client that stops reading its replies
 
 static std::string upper(std::string s) {
   for (char& c : s) c = toupper(static_cast<unsigned char>(c));
@@ -50,8 +53,8 @@ static void execute(Store& store, std::vector<std::string>& a, std::string& out)
       }
       at = opt == "PX" ? now_ms() + ms : ms;
     }
-    store.set(a[1], std::move(a[2]), at);
-    out += "+OK\r\n";
+    if (store.set(a[1], std::move(a[2]), at)) out += "+OK\r\n";
+    else out += "-ERR value too large for this node's --max-mb / --shards\r\n";
   } else if (cmd == "DEL" && n >= 2) {
     int64_t removed = 0;
     for (size_t i = 1; i < n; i++) removed += store.del(a[i]);
@@ -77,6 +80,11 @@ static void serve(int fd, Store& store) {
   std::string in, out;
   std::vector<std::string> args;
   char buf[16 << 10];
+  auto flush = [&] {  // false if the client is gone or stopped reading
+    const bool ok = out.empty() || resp::write_all(fd, out.data(), out.size());
+    out.clear();
+    return ok;
+  };
   for (;;) {
     ssize_t r = ::read(fd, buf, sizeof buf);
     if (r < 0 && errno == EINTR) continue;
@@ -86,16 +94,17 @@ static void serve(int fd, Store& store) {
     // stays buffered until the rest of it arrives.
     size_t pos = 0, used = 0;
     resp::Status st;
-    while ((st = resp::parse_request(in.data() + pos, in.size() - pos, args, used)) == resp::kOk) {
+    bool ok = true;
+    while (ok && (st = resp::parse_request(in.data() + pos, in.size() - pos, args, used)) == resp::kOk) {
       execute(store, args, out);
       pos += used;
+      if (out.size() >= kFlushAt) ok = flush();  // a packet of GETs must not pile up GBs
     }
+    if (!ok) break;
     in.erase(0, pos);
     const bool bad = st == resp::kError || in.size() > kMaxRequest;
     if (bad) out += "-ERR Protocol error\r\n";
-    if (!out.empty() && !resp::write_all(fd, out.data(), out.size())) break;
-    out.clear();
-    if (bad) break;  // framing is lost; like Redis, reply and hang up
+    if (!flush() || bad) break;  // on bad framing, like Redis, reply and hang up
   }
   ::close(fd);
 }
@@ -165,8 +174,14 @@ int main(int argc, char** argv) {
     int fd = accept(lfd, nullptr, nullptr);
     if (fd < 0) continue;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    timeval tv{kSendTimeoutSec, 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     // ponytail: thread per connection; switch to an epoll/kqueue loop past ~1k clients
-    std::thread(serve, fd, std::ref(store)).detach();
+    try {
+      std::thread(serve, fd, std::ref(store)).detach();
+    } catch (const std::system_error&) {  // out of threads: turn this client away, keep serving
+      ::close(fd);
+    }
   }
   // Make the log durable, then exit without unwinding: detached connection
   // threads may still be using `store`.

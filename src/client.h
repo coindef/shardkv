@@ -144,6 +144,8 @@ class Cluster {
     for (size_t i = 0; i < addrs.size(); i++) {
       size_t colon = addrs[i].rfind(':');
       if (colon == std::string::npos) throw std::invalid_argument("expected host:port: " + addrs[i]);
+      if (std::find(addrs.begin(), addrs.begin() + i, addrs[i]) != addrs.begin() + i)
+        throw std::invalid_argument("node listed twice: " + addrs[i]);
       nodes_[i].host = addrs[i].substr(0, colon);
       nodes_[i].port = addrs[i].substr(colon + 1);
       for (int v = 0; v < std::max(vnodes, 1); v++)
@@ -164,7 +166,9 @@ class Cluster {
     return out;
   }
 
-  // The value, or nullopt if the key does not exist. Throws if no replica answers.
+  // The value, or nullopt if the key does not exist. Throws if no replica
+  // answers. Every call throws std::invalid_argument for a key or value over
+  // the server's 16 MB limit, which the server would answer by hanging up.
   std::optional<std::string> get(const std::string& key) {
     resp::Reply r;
     for (size_t n : preference_list(key))
@@ -199,9 +203,10 @@ class Cluster {
   }
 
   bool call(size_t i, const std::vector<std::string>& cmd, resp::Reply& r) {
+    for (const auto& a : cmd)
+      if (a.size() > resp::kMaxBulk) throw std::invalid_argument("key or value larger than 16 MB");
     Node& n = nodes_[i];
-    auto now = std::chrono::steady_clock::now();
-    if (now < n.retry_at) return false;  // failed recently: don't wait on it again
+    if (std::chrono::steady_clock::now() < n.retry_at) return false;  // failed recently: skip it
     // A pooled connection can be stale (e.g. the node restarted), so a failure
     // on one gets a single retry over a fresh connection.
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -210,7 +215,9 @@ class Cluster {
       if (n.conn.call(cmd, r)) return true;
       if (fresh) break;
     }
-    n.retry_at = now + std::chrono::seconds(1);  // ponytail: fixed 1 s backoff
+    // ponytail: fixed 1 s backoff, counted from the failure, not from the start
+    // of an attempt that may itself have spent two timeouts.
+    n.retry_at = std::chrono::steady_clock::now() + std::chrono::seconds(1);
     return false;
   }
 

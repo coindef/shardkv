@@ -1,6 +1,6 @@
 // Unit tests (plain asserts): RESP codec, LRU eviction, TTL expiry, AOF replay
-// and torn-tail recovery, hash-ring placement, and a concurrent smoke test
-// that gives ThreadSanitizer something to chew on.
+// and torn-tail recovery, hash-ring placement, client failover backoff, and a
+// concurrent smoke test that gives ThreadSanitizer something to chew on.
 #undef NDEBUG
 #include <sys/stat.h>
 
@@ -30,6 +30,9 @@ static void test_resp() {
   for (std::string bad : {"GET k\r\n", "*0\r\n", "*1\r\n:1\r\n", "*1\r\n$-1\r\n", "*1\r\n$2\r\nabc\r\n",
                           "*x\r\n", "*1\r\n$99999999999\r\n", "*1\r\n$1\r\na\n\n"})
     assert(resp::parse_request(bad.data(), bad.size(), args, used) == resp::kError);
+  for (std::string bad : {std::string("*1\0x\r\n", 6), std::string("*+1\r\n$1\r\na\r\n"),
+                          std::string("*1\r\n$ 1\r\na\r\n")})  // lengths are digits, nothing else
+    assert(resp::parse_request(bad.data(), bad.size(), args, used) == resp::kError);
 
   resp::Reply r;
   auto reply = [&](const std::string& s) { return resp::parse_reply(s.data(), s.size(), r, used); };
@@ -57,6 +60,9 @@ static void test_lru() {
   s.set("a", "9", 0);  // overwrite keeps the entry count
   assert(s.get("a", &v) && v == "9" && s.stats().keys == 3);
   assert(s.del("a") && !s.del("a") && s.stats().keys == 2);
+  // An entry bigger than the whole shard is refused, and the old value goes too.
+  assert(!s.set("c", std::string(200, 'x'), 0) && !s.get("c", &v));
+  assert(s.stats().keys == 1 && s.stats().bytes <= 3 * 66);
 }
 
 static void test_ttl() {
@@ -80,15 +86,18 @@ static void test_ttl() {
   assert(!s.get("past", &v));
 }
 
+static std::string tmp_path(const std::string& name) {
+  const char* tmp = getenv("TMPDIR");
+  return std::string(tmp ? tmp : "/tmp") + "/shardkv_" + name + "_" + std::to_string(getpid()) + ".aof";
+}
+
 static size_t replay_into(Store& s, const std::string& path) {
   Aof aof(path, 1000);
   return aof.replay([&](Args& cmd) { s.apply(cmd); });
 }
 
 static void test_aof() {
-  const char* tmp = getenv("TMPDIR");
-  const std::string path =
-      std::string(tmp ? tmp : "/tmp") + "/shardkv_unit_" + std::to_string(getpid()) + ".aof";
+  const std::string path = tmp_path("unit");
   unlink(path.c_str());
   std::string v;
   {
@@ -131,7 +140,8 @@ static void test_aof() {
     assert(s.get("d", &v) && v == "5" && !s.get("c", &v));
   }
 
-  // Flip a byte inside record 2: its CRC fails, so only record 1 survives.
+  // Flip a byte inside record 2: that is corruption, not a torn tail, so replay
+  // refuses to start rather than truncate the intact records after it.
   {
     const size_t rec1 = 8 + resp::encode({"SET", "a", "1"}).size();
     std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
@@ -139,9 +149,43 @@ static void test_aof() {
     f.put('X');
   }
   {
+    assert(stat(path.c_str(), &st) == 0);
+    const off_t size = st.st_size;
     Store s;
-    assert(replay_into(s, path) == 1);
-    assert(s.get("a", &v) && v == "1" && s.stats().keys == 1);
+    bool threw = false;
+    try {
+      replay_into(s, path);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    assert(threw && stat(path.c_str(), &st) == 0 && st.st_size == size);
+  }
+
+  // Replay must rebuild exactly what was live. GETs aren't logged, so it can't
+  // re-run eviction itself; the log carries each eviction as a DEL, and a DEL
+  // of a key that is no longer in memory is logged too.
+  unlink(path.c_str());
+  {
+    Store s(1, 3 * 66);
+    Aof aof(path, 10);
+    s.attach_aof(&aof);
+    s.set("a", "1", 0);
+    s.set("b", "2", 0);
+    s.set("c", "3", 0);
+    assert(s.get("a", &v));  // b is now the coldest
+    s.set("d", "4", 0);      // evicts b
+    assert(!s.del("b"));     // a cache invalidation that finds nothing
+  }
+  for (size_t cap : {3 * 66, 1 << 20}) {  // same budget, and a bigger one
+    Store s(1, cap);
+    replay_into(s, path);
+    assert(!s.get("b", &v) && s.get("a", &v) && s.get("c", &v) && s.get("d", &v));
+  }
+  {
+    Store s(1, 2 * 66);  // the budget shrank: replay keeps all 3, attach trims to 2
+    replay_into(s, path);
+    s.attach_aof(nullptr);
+    assert(s.stats().keys == 2 && s.stats().bytes <= 2 * 66);
   }
   unlink(path.c_str());
 }
@@ -170,8 +214,57 @@ static void test_ring() {
          load[2], moved, kKeys);
 }
 
+// One node that answers a single command and then hangs, like a SIGSTOPped
+// server: the kernel still accepts connections, but nothing ever replies.
+static void test_client() {
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t alen = sizeof addr;
+  assert(bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) == 0 && listen(lfd, 8) == 0 &&
+         getsockname(lfd, reinterpret_cast<sockaddr*>(&addr), &alen) == 0);
+  std::thread node([lfd] {
+    int fd = accept(lfd, nullptr, nullptr);
+    char buf[256];
+    assert(read(fd, buf, sizeof buf) > 0 && write(fd, "+OK\r\n", 5) == 5);
+    std::this_thread::sleep_for(1500ms);
+    close(fd);
+  });
+  const std::string me = "127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
+  bool threw = false;
+  try {
+    shardkv::Cluster({me, me});
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+
+  shardkv::Cluster c({me}, 1, 10, 200);
+  assert(c.set("k", "v"));
+  threw = false;
+  try {  // the server would hang up on it, so the client refuses to send it
+    c.set("k", std::string(resp::kMaxBulk + 1, 'x'));
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+  assert(!c.set("k", "v"));  // pooled connection times out, then a fresh one does
+  // The 1 s backoff counts from that failure, not from when the attempt began
+  // (two timeouts earlier), so the node is still skipped without waiting.
+  std::this_thread::sleep_for(700ms);
+  const auto t0 = std::chrono::steady_clock::now();
+  assert(!c.set("k", "v") && std::chrono::steady_clock::now() - t0 < 100ms);
+  node.join();
+  close(lfd);
+}
+
 static void test_concurrent() {
-  Store s(8, 1 << 16);  // small, so eviction runs too
+  const std::string path = tmp_path("concurrent");
+  unlink(path.c_str());
+  Store s(8, 1 << 14);  // small, so eviction runs too
+  Aof aof(path, 5);
+  s.attach_aof(&aof);
   std::atomic<uint64_t> gets{0};
   std::vector<std::thread> ts;
   for (int t = 0; t < 8; t++)
@@ -193,7 +286,18 @@ static void test_concurrent() {
   for (auto& t : ts) t.join();
   sweeper.join();
   Store::Stats st = s.stats();
-  assert(st.hits + st.misses == gets && st.bytes <= (1 << 16));
+  assert(st.hits + st.misses == gets && st.bytes <= (1 << 14) && st.evictions > 0);
+
+  // Replaying what 8 racing writers logged gives back exactly the live store.
+  std::this_thread::sleep_for(5ms);  // let every 1 ms TTL lapse in both
+  Store r(8, 1 << 14);
+  replay_into(r, path);
+  for (int i = 0; i < 500; i++) {
+    const std::string k = "k" + std::to_string(i);
+    std::string a, b;
+    assert(s.get(k, &a) == r.get(k, &b) && a == b);
+  }
+  unlink(path.c_str());
 }
 
 int main() {
@@ -202,6 +306,7 @@ int main() {
   test_ttl();
   test_aof();
   test_ring();
+  test_client();
   test_concurrent();
   printf("unit tests: PASS\n");
 }

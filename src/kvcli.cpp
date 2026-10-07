@@ -17,8 +17,10 @@ static int run(shardkv::Cluster& c, const std::vector<std::string>& a) {
       return 0;
     }
     bool ok;
-    if (op == "set" && (a.size() == 3 || a.size() == 4))
-      ok = c.set(a[1], a[2], a.size() == 4 ? atoll(a[3].c_str()) : 0);
+    char* end = nullptr;
+    const long long ttl = a.size() == 4 ? strtoll(a[3].c_str(), &end, 10) : 0;
+    if (op == "set" && (a.size() == 3 || (a.size() == 4 && ttl > 0 && !*end)))
+      ok = c.set(a[1], a[2], ttl);
     else if (op == "del" && a.size() == 2)
       ok = c.del(a[1]);
     else {

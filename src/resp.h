@@ -46,9 +46,12 @@ struct Cursor {
   Status integer(long long& v) {
     std::string s;
     if (Status st = line(s); st != kOk) return st;
+    // digits with an optional '-': strtoll alone would also take "+1", " 1" or "1\0junk"
+    if (s.empty() || s.size() > 18 || s.find_first_not_of("0123456789", s[0] == '-') != s.npos)
+      return kError;
     char* end = nullptr;
     v = strtoll(s.c_str(), &end, 10);
-    return s.empty() || s.size() > 18 || *end ? kError : kOk;
+    return *end ? kError : kOk;
   }
   Status bulk(std::string& out, bool& nil) {
     long long len;
