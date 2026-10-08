@@ -11,11 +11,14 @@ libraries.
 
 ## Highlights
 
-- **190k SET ops/s on one node** with 16 client threads (142k with the AOF
-  on). A single client (90% GET) sees a 14 µs p50 and 22 µs p99.
-- **92k ops/s on a 3-node cluster at R=2** (90% GET, AOF on) with a 125 µs
-  p99, where every GET asks both replicas. Numbers are from `make bench` on
-  an Apple M5; see [Benchmarks](#benchmarks).
+- **184k ops/s on one node** with 8 client threads at 90:10 GET:SET over
+  100k preloaded keys, with a 42 µs p50 and 67 µs p99.
+- **93k ops/s on a 3-node cluster at R=2** (90:10, 118 µs p99), where every
+  GET asks both replicas. 95k ops/s at 50:50 with 16 threads.
+- **Failover:** SIGKILLing one of the 3 nodes in the middle of a 20 s run
+  caused 0 failed reads or writes. Numbers are from `make bench` on an
+  Apple M5, with all nodes and clients on one machine over localhost; see
+  [Benchmarks](#benchmarks).
 - **Replication:** consistent hashing with 100 virtual nodes per server
   (about 1/N of the stored copies move when a node joins), plus
   last-writer-wins versions, tombstones, and read repair, so a restarted
@@ -65,7 +68,7 @@ libraries.
 | `src/kvserver.cpp` | TCP server and command dispatch |
 | `src/client.h` | Header-only cluster client: hash ring, versioned replication, write quorum, read repair, reconnect |
 | `src/kvcli.cpp` | CLI built on the client library |
-| `src/kvbench.cpp` | Multithreaded load generator that reports ops/s and p50/p95/p99 |
+| `src/kvbench.cpp` | Multithreaded load generator that reports ops/s, p50/p95/p99, and GET hit rate |
 
 ### Storage engine
 - **Lock striping.** Keys hash to one of N shards (default 16). Each shard has
@@ -209,7 +212,7 @@ make              # build/kvserver build/kvcli build/kvbench build/unit_test
 make test         # unit tests + 3-node integration test
 make tsan         # same tests, everything built with -fsanitize=thread
 make asan         # same tests under -fsanitize=address,undefined
-make bench        # benchmark table for the README (about 2.5 min, not run in CI)
+make bench        # benchmark tables for the README (about 3 min, not run in CI)
 ```
 
 ```sh
@@ -303,33 +306,68 @@ its replies is disconnected once a send makes no progress for 10 s.
 
 ## Benchmarks
 
-Apple M5 (10 cores), macOS 26.2 arm64, 2026-10-08. Reproduce with
-`make bench` (`tests/bench.py`).
+**Machine.** `sysctl -n machdep.cpu.brand_string` = Apple M5,
+`sysctl -n hw.ncpu` = 10. macOS 26.2 arm64, Apple clang 17.0.0, built with
+plain `make` (`-O2`, no sanitizers). Run on 2026-10-08. Other processes were
+running too: the load average was 4.6 when the run started.
 
-| nodes | R | AOF | threads | GET % | ops/s | p50 µs | p99 µs |
-|---:|---:|---|---:|---:|---:|---:|---:|
-| 1 | 1 | on | 1 | 90 | 70986 | 14 | 22 |
-| 1 | 1 | on | 16 | 0 | 142159 | 99 | 294 |
-| 1 | 1 | off | 16 | 0 | 189534 | 83 | 113 |
-| 3 | 2 | on | 8 | 90 | 92225 | 84 | 125 |
-| 3 | 2 | off | 8 | 90 | 94499 | 83 | 118 |
-| 3 | 2 | on | 8 | 0 | 73856 | 105 | 169 |
-| 3 | 2 | off | 8 | 0 | 94351 | 83 | 117 |
-| 3 | 1 | on | 8 | 90 | 182288 | 42 | 70 |
+**All nodes and all client threads ran on this one machine and talked over
+localhost (127.0.0.1).** They share the 10 cores, and no real network is
+involved. So these numbers measure the code path, not a deployment.
 
-**Method.** Each row starts fresh nodes and prefills 10,000 keys with
-100 B values. It then runs `kvbench` 3 times for 5 s each and shows the
-run with the median throughput, with that run's p50 and p99. kvbench is
-closed-loop: each thread sends its next request when the previous one
-returns. The client and the servers run on the same machine and share its
-cores, so these numbers measure the code path, not a network. Expect about
-±10% between runs. A GET at R=2 asks both replicas, one after the other,
-which is why the R=1 row does about twice the ops/s. AOF on means the
-default `--fsync-ms 1000`.
+| run | nodes | R | threads | GET:SET | ops/s (median) | p50 µs | p95 µs | p99 µs | GET hit rate | ops/s of all 3 runs |
+|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|
+| a | 1 | 1 | 8 | 90:10 | 184,327 | 42.0 | 57.8 | 67.1 | 100.00% | 184,281 / 184,327 / 184,638 |
+| b | 3 | 2 | 8 | 90:10 | 93,483 | 84.1 | 105.7 | 118.3 | 100.00% | 93,015 / 93,483 / 93,623 |
+| c | 3 | 2 | 16 | 50:50 | 95,030 | 167.0 | 192.6 | 208.2 | 100.00% | 93,864 / 95,030 / 95,181 |
+
+**Commands.** `make bench` runs `tests/bench.py build`. For each row it
+starts fresh nodes with the default flags (no AOF, `--max-mb 256 --shards 16`),
+runs kvbench 3 times, and stops the nodes:
+
+```sh
+build/kvserver --port $P &        # one per node
+build/kvbench --nodes $NODES --replicas $R --threads $T --keys 100000 \
+  --value-size 128 --get-ratio $G --duration 15 --preload 1   # x3
+```
+
+**Method.** `--preload 1` first SETs all 100,000 keys through the cluster
+client, so every key is on all R of its replicas. This step is not timed,
+and it runs before each of the 3 runs. The measured part is closed-loop:
+each thread picks a uniformly random key and sends its next request as soon
+as the last one returns. The row shows the run with the median throughput,
+with that run's percentiles. The 3 runs were within 2% of each other. GET hit
+rate is the share of successful GETs that returned a value. At R=2 one
+request includes both replica round trips, one after the other. That is
+why rows b and c are about half of row a's ops/s.
+
+**Failover check.** 3 nodes, R=2, 8 threads, 90:10. One 20 s run, and
+`tests/bench.py` SIGKILLs node 2 of 3 10.01 s after the measured part
+starts:
+
+```sh
+build/kvbench --nodes $NODES --replicas 2 --threads 8 --keys 100000 --value-size 128 \
+  --get-ratio 0.9 --duration 20 --preload 1 --interval 1
+```
+
+| window | mean ops/s | GET errors | SET errors |
+|---|---:|---:|---:|
+| 0-10 s, before the kill | 93,446 | 0 | 0 |
+| 10-11 s, contains the kill | 143,404 | 0 | 0 |
+| 11-20 s, after the kill | 144,951 | 0 | 0 |
+| whole run (2,382,430 ops) | 119,086 | 0 | 0 |
+
+Reads kept succeeding, with 0 errors and a 100.00% GET hit rate over the
+whole run. Throughput went up after the kill, not down. A client that sees a
+node fail skips it for 1 s and then retries. So the keys that had a copy on
+the dead node (about 2/3 of them) cost one round trip instead of two, and one less
+server shares the cores. The cost is redundancy: writes to those keys landed
+on one replica only (W=1). When the node comes back, read repair catches it
+up only on the keys that get read.
 
 `make bench` also compares one kvserver with one redis-server using
 `redis-benchmark` when both are installed. They were not installed for
-this run, so there is no Redis comparison yet.
+this run, so there is no Redis comparison.
 
 ## Limitations
 
