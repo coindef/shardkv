@@ -29,8 +29,9 @@ libraries.
   append-only log with torn-tail recovery, tested by truncating the log and
   by SIGKILLing a node.
 - **Testing:** ThreadSanitizer, AddressSanitizer + UBSan, and a seeded
-  randomized parser property test, with a GitHub Actions workflow for
-  Ubuntu and macOS included.
+  randomized parser property test. CI (GitHub Actions) runs 7 jobs on
+  every push: Ubuntu and macOS with Clang (tests, ThreadSanitizer,
+  ASan/UBSan) plus Ubuntu with GCC.
 
 ## Design
 
@@ -204,8 +205,9 @@ libraries.
 
 Requires clang++ or g++ (C++17), make, and python3. `make` uses clang++ when
 it is installed and the system `c++` otherwise; pick one with `make CXX=g++`.
-Tested on macOS. `.github/workflows/ci.yml` is a GitHub Actions workflow that
-builds and tests on Ubuntu and macOS.
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs 7 jobs on every push:
+Ubuntu and macOS with Clang (tests, ThreadSanitizer, ASan/UBSan) plus Ubuntu
+with GCC.
 
 ```sh
 make              # build/kvserver build/kvcli build/kvbench build/unit_test
