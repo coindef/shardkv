@@ -56,7 +56,7 @@ struct Cursor {
     v = strtoll(s.c_str(), &end, 10);
     return *end ? kError : kOk;
   }
-  Status bulk(std::string& out, bool& nil) {
+  Status bulk(std::string* out, bool& nil) {  // out null: check framing only
     long long len;
     if (Status st = integer(len); st != kOk) return st;
     nil = len == -1;
@@ -64,28 +64,34 @@ struct Cursor {
     if (len < 0 || size_t(len) > kMaxBulk) return kError;
     if (n - i < size_t(len) + 2) return kIncomplete;
     if (p[i + len] != '\r' || p[i + len + 1] != '\n') return kError;
-    out.assign(p + i, len);
+    if (out) out->assign(p + i, len);
     i += len + 2;
     return kOk;
   }
 };
 
 // Parses one command. On kOk, `args` holds it and `used` is its size in bytes.
+// Pass 0 only checks framing and pass 1 copies: a big command is re-parsed
+// on every read until it is complete, and copying its finished args each time
+// would make that quadratic in its size.
 inline Status parse_request(const char* buf, size_t len, std::vector<std::string>& args,
                             size_t& used) {
-  Cursor c{buf, len, 0};
-  long long n = 0;
-  Status st = c.expect('*');
-  if (st == kOk) st = c.integer(n);
-  if (st != kOk) return st;
-  if (n < 1 || size_t(n) > kMaxArgs) return kError;
-  args.resize(n);
-  for (auto& a : args) {
-    bool nil = false;
-    if ((st = c.expect('$')) != kOk || (st = c.bulk(a, nil)) != kOk) return st;
-    if (nil) return kError;
+  for (int pass = 0; pass < 2; pass++) {
+    Cursor c{buf, len, 0};
+    long long n = 0;
+    Status st = c.expect('*');
+    if (st == kOk) st = c.integer(n);
+    if (st != kOk) return st;
+    if (n < 1 || size_t(n) > kMaxArgs) return kError;
+    if (pass) args.resize(n);
+    for (long long k = 0; k < n; k++) {
+      bool nil = false;
+      if ((st = c.expect('$')) != kOk || (st = c.bulk(pass ? &args[k] : nullptr, nil)) != kOk)
+        return st;
+      if (nil) return kError;
+    }
+    used = c.i;
   }
-  used = c.i;
   return kOk;
 }
 
@@ -97,7 +103,7 @@ inline Status parse_reply(const char* buf, size_t len, Reply& r, size_t& used) {
   Status st = kError;
   if (r.type == '+' || r.type == '-') st = c.line(r.str);
   else if (r.type == ':') st = c.integer(r.num);
-  else if (r.type == '$') st = c.bulk(r.str, r.nil);
+  else if (r.type == '$') st = c.bulk(&r.str, r.nil);
   else if (r.type == '*' && (st = c.integer(r.num)) == kOk) {
     if (r.num < 0 || size_t(r.num) > kMaxArgs) return kError;
     r.elems.resize(r.num);

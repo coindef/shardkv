@@ -86,7 +86,10 @@ libraries.
   that records a versioned delete. GET treats it as a miss, but it still
   counts in `DBSIZE`, uses LRU budget, and can be evicted. Every tombstone
   expires 10 minutes after it is written (the grace period), and the normal
-  expiry path then removes it. That is the tombstone GC.
+  expiry path then removes it. That is the tombstone GC. When a versioned
+  value's TTL runs out, it becomes a tombstone with the same version for the
+  grace period. Otherwise a replica that missed that write could win the
+  next read with an older value, and read repair would copy it back.
 
 ### Durability (AOF)
 - Record format: `[u32 len][u32 crc32][payload]`. The payload is the command
@@ -109,13 +112,17 @@ libraries.
   was live at the crash, so a deleted key never comes back. If `--max-mb`
   shrank between runs, the shards are trimmed once replay is done.
   Expirations are not logged. They don't need to be, because deadlines are
-  absolute and replay skips entries that are already dead.
-- **Replay** runs on startup and re-applies records in order. A bad record
-  (truncated or failing its CRC) with no intact record after it is what a
-  crash in the middle of a write leaves behind. Replay `ftruncate`s the file
-  there so new appends follow valid data. A bad record with intact records
-  after it is corruption, not a crash. The server then refuses to start
-  rather than throw that data away.
+  absolute and replay expires entries that are already dead the same way
+  (a versioned value within its grace period comes back as its tombstone).
+- **Replay** runs on startup and re-applies records in order. A crash in the
+  middle of a write leaves a bad record (truncated or failing its CRC) that
+  is the start of one record cut off by the end of the file (its length runs
+  past the end and its payload is an unfinished command), or that has no
+  intact record after it. Replay `ftruncate`s the file there so new appends
+  follow valid data. A value that happens to contain a valid record does not
+  change this. Any other bad record with intact records after it is
+  corruption, not a crash. The server then refuses to start rather than
+  throw that data away.
 
 ### Cluster and consistency model
 - **Placement.** Each server gets 100 virtual nodes on a 64-bit ring (FNV-1a
@@ -125,20 +132,32 @@ libraries.
   The unit tests check this.
 - **Versions.** The client stamps every write with a 64-bit version:
   `[unix ms:48][per-ms sequence:6][client id:10]`. The client id is random,
-  and versions strictly increase per client. Each replica keeps the highest
-  version it has seen (last writer wins, LWW) and ignores an older or equal
-  one, which still gets `+OK`.
+  and versions strictly increase per client. A client that writes more than
+  64 times in one ms borrows from the next ms, so its clock can run ahead of
+  wall time. Each replica keeps the highest version it has seen (last writer
+  wins, LWW). A write that loses to a higher version, or to a different
+  write with the same version, is ignored and answered `-STALE <winning
+  version>`. The same write again (a retry or a repeated read repair) gets
+  `+OK` and changes nothing.
 - **Writes** (`SET ... VER n`) go to all R replicas one after another and
-  succeed if at least W ack. W defaults to 1 (`--write-quorum` in kvcli).
+  succeed if at least W ack. W defaults to 1 (`--write-quorum` in kvcli) and
+  must be between 1 and R. If any replica answers `-STALE`, the client moves
+  its clock past that version (keeping its own id, as a hybrid logical clock
+  does) and redoes the write with a new version. So a write that comes after
+  another client's does not get `+OK` and then lose to it, even when that
+  client's clock is ahead or both wrote in the same millisecond. Writers
+  racing on one key can keep beating each other, so after 5 rounds the
+  write reports failure.
 - **Deletes** write a tombstone with a new version (`DELV key ver`) instead
   of removing the key. Without it, a replica that missed the delete would
   still hold the old value, and read repair would copy it back. Tombstones
   are kept for a 10-minute grace period and then garbage-collected.
 - **Reads** ask all R replicas for `(version, value, expiry)` with `GETV`.
   A replica that fails or times out (default 500 ms) is skipped, and at
-  least one must answer. The highest version wins, and ties go to the
-  earliest replica in the preference list. A tombstone or no entry reads as
-  a miss.
+  least one must answer. The highest version wins. On a tie a value beats a
+  miss (no entry and an unversioned value both report version 0), and then
+  the earliest replica in the preference list wins. A tombstone or no entry
+  reads as a miss.
 - **Read repair.** Each replica that answered with a lower version gets the
   winner written back (`SET key val [PXAT at] VER v`, or `DELV key v` for a
   tombstone). This is best effort: failures are ignored. Because equal
@@ -147,23 +166,34 @@ libraries.
   written before versions existed) always apply and store version 0. Any
   versioned entry beats them during read repair.
 - **Eviction is local, deletion is global.** An LRU eviction removes the key
-  from that node only and never creates a tombstone.
+  from that node only and never creates a tombstone. So if the replica that
+  took an overwrite evicts it, a replica that missed the overwrite wins the
+  next read with the older value, and read repair copies that value back.
 - **Reconnect.** A failed node is skipped for 1 s after the failure, then
   retried with a fresh connection. A pooled connection that went stale (for
   example because the node restarted) gets one immediate retry on a new
-  socket.
+  socket. A node that hangs (it still accepts connections but never replies)
+  therefore costs two timeouts, 1 s by default, before it is skipped.
 - **Read-your-writes.** A read needs only one replica to answer, so its
   read quorum is 1. In Dynamo's terms (read quorum + W > replicas) reads are
-  guaranteed to see the latest acknowledged write when W = R. With W=1, a
-  read returns an older value only if every replica that took the write is
-  unreachable at that moment.
+  guaranteed to see the latest acknowledged write when W = R. Every replica
+  took that write, and a replica holding a higher version would have made
+  the writer move past it. With W < R, a read can also return an older
+  value in three cases. Every replica that took the write may be
+  unreachable at that moment. They may have evicted the key. Or the write
+  may have reached none of the replicas that hold an older write stamped
+  with a higher version (see Limitations).
 - The client throws `std::invalid_argument` for a key or value over 16 MB
   instead of sending it, because the server would hang up on it. It also
-  throws for a node that is listed twice.
+  throws for a `host:port` string that is listed twice. It compares the
+  strings only, so `127.0.0.1:7001` and `localhost:7001` count as two nodes
+  and would put two replicas on one server.
 
 ## Build, run, test
 
-Requires clang++ or g++ (C++17), make, and python3. CI builds and tests on Ubuntu and macOS.
+Requires clang++ or g++ (C++17), make, and python3. `make` uses clang++ when
+it is installed and the system `c++` otherwise; pick one with `make CXX=g++`.
+CI builds and tests on Ubuntu and macOS.
 
 ```sh
 make              # build/kvserver build/kvcli build/kvbench build/unit_test
@@ -201,15 +231,19 @@ the following:
   when it arrived whole and `kError` when split before its CR
 - LRU eviction order and oversized entries
 - lazy and active TTL expiry
-- AOF replay: a torn tail is truncated, mid-file corruption is refused, and
-  replay after evictions and a DEL of an evicted key gives back exactly the
-  live keys
-- last-writer-wins: older and equal versions are ignored and not logged, a
-  tombstone hides the key from GET and blocks older writes until its grace
-  period ends and the sweeper drops it, unversioned writes always apply, and
-  AOF replay restores every key's value and version
+- AOF replay: a torn tail is truncated (also when the torn value holds a
+  valid record), mid-file corruption is refused, and replay after evictions
+  and a DEL of an evicted key gives back exactly the live keys
+- last-writer-wins: an older version, or a different value at an equal
+  version, is ignored, not logged, and reported as stale, while the same
+  write repeated is a quiet no-op. A tombstone hides the key from GET and
+  blocks older writes until its grace period ends and the sweeper drops it.
+  A versioned value whose TTL runs out leaves a tombstone with its version.
+  Unversioned writes always apply, and AOF replay restores every key's value
+  and version
 - the balance and minimal key movement of the hash ring
-- client failover backoff against a node that hangs
+- client failover backoff against a node that hangs, and refusing a write
+  quorum above R
 - an 8-thread stress test of the store with the AOF on, mixing plain,
   versioned and tombstone writes, checking that replaying its log
   reproduces the live store, versions included
@@ -217,18 +251,22 @@ the following:
 `tests/integration_test.py` does the following:
 1. Starts 3 nodes.
 2. Checks pipelining, partial reads, malformed input, and `SET ... VER` /
-   `GETV` / `DELV` on the raw protocol.
+   `GETV` / `DELV` on the raw protocol, `-STALE` replies included.
 3. Writes 300 keys through `kvcli` and checks that each key is on exactly 2
    nodes.
 4. `SIGKILL`s one node and reads every key back through failover. While it
-   is down, updates 10 of its keys and deletes 10 more, and checks that a
-   `--write-quorum 2` write fails.
+   is down, updates 10 of its keys, deletes 10 more, overwrites one with a
+   200 ms TTL, and checks that a `--write-quorum 2` write fails.
 5. Restarts that node and checks that AOF replay restored exactly its keys,
    which are now stale.
 6. Reads the updated and deleted keys through `kvcli`, then checks that read
    repair brought the restarted node up to date, that no node returns a
-   deleted key, and that the node holds the tombstone.
-7. Runs a short `kvbench`.
+   deleted key, and that the node holds the tombstone. Once the TTL has run
+   out, checks that the node's older value for that key does not come back.
+7. Writes a key on every node with a version a minute ahead, as a client
+   whose clock is ahead would. Then checks that a `--write-quorum 2` write
+   through `kvcli` goes past it on both replicas.
+8. Runs a short `kvbench`.
 
 ## Protocol
 
@@ -239,10 +277,10 @@ redis-cli and every Redis client send. Inline commands are not supported.
 |---------|-------|
 | `PING` | `+PONG` |
 | `GET key` | bulk string or `$-1` (nil) |
-| `SET key value [PX ms \| PXAT unix-ms] [VER n]` | `+OK`, also when a `VER` write loses to an equal or newer version and is ignored |
+| `SET key value [PX ms \| PXAT unix-ms] [VER n]` | `+OK`, or `-STALE ver` when a `VER` write lost to version `ver` (higher, or equal with a different value) and was ignored. The same write repeated gets `+OK` |
 | `DEL key [key ...]` | `:n` keys removed (a tombstone is removed but not counted) |
-| `GETV key` | `*3` array: `:version` (0 = no entry), the value or `$-1` (nil with a version > 0 is a tombstone), `:expire_at` (unix ms, 0 = none) |
-| `DELV key ver` | `+OK`; stores a tombstone with that version for 10 minutes |
+| `GETV key` | `*3` array: `:version` (0 = no entry or an unversioned value), the value or `$-1` (nil with a version > 0 is a tombstone, which is also what a versioned value becomes when its TTL runs out), `:expire_at` (unix ms; 0 = no TTL, and always 0 for nil) |
+| `DELV key ver` | `+OK`, or `-STALE ver` as for SET; stores a tombstone with that version for 10 minutes |
 | `DBSIZE` | `:n`, counting tombstones and expired keys the sweeper has not reached yet |
 | `INFO` / `STATS` | bulk string with `keys`, `used_bytes`, `hits`, `misses`, `evictions`, `expired` |
 
@@ -288,16 +326,22 @@ this run, so there is no Redis comparison yet.
 - **Read repair only.** There is no anti-entropy (Merkle-tree sync) or
   hinted handoff, so a replica that missed writes catches up only on the
   keys that get read. A key that is never read stays stale there. If a
-  replica that missed a delete stays down longer than the 10-minute
-  tombstone grace period, or the other replica evicts the tombstone, read
-  repair copies the deleted value back (Cassandra's `gc_grace_seconds` has
-  the same trade-off).
-- **LWW on client wall clocks.** Versions come from each client's clock, so
-  clock skew between clients can let an older write win. Hybrid logical
-  clocks are the upgrade path. A write that fails its W quorum is not rolled
-  back: the replicas that took it keep it, and a later read can return it.
-  Reads are guaranteed to see the latest acknowledged write only when W = R
-  (see Read-your-writes above).
+  replica that missed a delete (or a TTL'd overwrite) stays down longer than
+  the 10-minute tombstone grace period, or the other replica evicts the
+  tombstone, read repair copies the older value back (Cassandra's
+  `gc_grace_seconds` has the same trade-off). Eviction of a value is the
+  same: if the replica that took an overwrite evicts it, the older value on
+  a replica that missed the overwrite wins the next read.
+- **LWW on client clocks.** Versions come from each client's clock. A write
+  that finds a higher version on a replica moves past it, so with W = R no
+  acknowledged write is lost. With W < R, a write can reach none of the
+  replicas that hold a higher version. An older write then still wins over
+  it. That happens when clocks are skewed, when a client writing more than
+  64 times per ms has run ahead of wall time, or when both writes came in
+  the same ms. A write that fails its W quorum is not rolled back: the
+  replicas that took it keep it, and a later read can return it. Reads are
+  guaranteed to see the latest acknowledged write only when W = R (see
+  Read-your-writes above).
 - **Static membership.** The node list is fixed when the client is created.
   There is no rebalancing or data migration when nodes join or leave.
 - **Thread per connection.** This is simple, but it will not scale past a

@@ -4,7 +4,9 @@
 // on the first R distinct nodes clockwise from its hash (its preference list).
 //   writes: stamped with a new version and sent to all R replicas; succeed if
 //           at least W ack (default 1). A delete writes a versioned tombstone.
-//           Replicas keep the highest version they see (last writer wins).
+//           Replicas keep the highest version they see (last writer wins). A
+//           replica that already holds a newer version answers -STALE <it>, so
+//           the client moves its clock past that version and writes again.
 //   reads:  ask every replica for its version (GETV), skipping any that fail
 //           or time out, and return the newest. Replicas that answered with
 //           an older version get the newest one written back (read repair).
@@ -144,13 +146,15 @@ class Conn {
 
 class Cluster {
  public:
-  // addrs: "host:port" per node. write_quorum (W) is clamped to 1..R.
+  // addrs: "host:port" per node. R is capped at the node count, and
+  // write_quorum (W) must be in 1..R.
   explicit Cluster(const std::vector<std::string>& addrs, int replicas = 2, int vnodes = 100,
                    int timeout_ms = 500, int write_quorum = 1)
-      : nodes_(addrs.size()), timeout_ms_(timeout_ms) {
+      : nodes_(addrs.size()), timeout_ms_(timeout_ms), w_(write_quorum) {
     if (addrs.empty()) throw std::invalid_argument("no nodes given");
     replicas_ = std::min<size_t>(std::max(replicas, 1), addrs.size());
-    w_ = std::clamp(write_quorum, 1, int(replicas_));
+    if (w_ < 1 || w_ > int(replicas_))
+      throw std::invalid_argument("write quorum must be 1.." + std::to_string(replicas_));
     signal(SIGPIPE, SIG_IGN);  // a dead peer should be an EPIPE error, not kill us
     for (size_t i = 0; i < addrs.size(); i++) {
       size_t colon = addrs[i].rfind(':');
@@ -193,9 +197,11 @@ class Cluster {
       if (call(n, {"GETV", key}, r) && r.type == '*' && r.elems.size() == 3)
         got.push_back({n, uint64_t(r.elems[0].num), std::move(r)});
     if (got.empty()) throw std::runtime_error("GET " + key + ": no replica reachable");
-    // max_element keeps the first of equal versions: ties go to preference order.
-    const Answer& win = *std::max_element(
-        got.begin(), got.end(), [](const Answer& a, const Answer& b) { return a.ver < b.ver; });
+    // Equal versions (0: no entry or an unversioned value) prefer a value, then
+    // preference order, since max_element keeps the first of equal elements.
+    const Answer& win = *std::max_element(got.begin(), got.end(), [](const Answer& a, const Answer& b) {
+      return std::make_pair(a.ver, !a.r.elems[1].nil) < std::make_pair(b.ver, !b.r.elems[1].nil);
+    });
     const resp::Reply& val = win.r.elems[1];
     const std::string ver = std::to_string(win.ver);
     std::vector<std::string> fix{"DELV", key, ver};  // newest is a tombstone
@@ -215,14 +221,14 @@ class Cluster {
   bool set(const std::string& key, const std::string& val, int64_t ttl_ms = 0) {
     std::vector<std::string> cmd{"SET", key, val};
     if (ttl_ms > 0) cmd.insert(cmd.end(), {"PX", std::to_string(ttl_ms)});
-    cmd.insert(cmd.end(), {"VER", std::to_string(next_version())});
+    cmd.insert(cmd.end(), {"VER", ""});
     return write_replicas(key, cmd);
   }
 
   // Writes a tombstone, so a replica that missed the delete can't bring the
   // key back through read repair. True if at least W replicas acked.
   bool del(const std::string& key) {
-    return write_replicas(key, {"DELV", key, std::to_string(next_version())});
+    return write_replicas(key, {"DELV", key, ""});
   }
 
  private:
@@ -238,13 +244,33 @@ class Cluster {
     return last_ver_ = std::max(uint64_t(wall_ms()) << 16 | id_, last_ver_ + (1u << 10));
   }
 
+  // Stamps cmd's last argument with a new version and sends it to all R
+  // replicas. A replica holding a newer version (another client's clock is
+  // ahead, or it wrote in the same ms with a higher id) answers -STALE <ver>:
+  // the write would be dropped there, so the clock (keeping our id) moves past
+  // that version and the write is redone. Racing writers to one key can keep
+  // leapfrogging, so after kMaxStale rounds the write reports failure.
   // ponytail: replicas are written (and read) one after another; pipeline the
   // fan-out if latency matters.
-  bool write_replicas(const std::string& key, const std::vector<std::string>& cmd) {
-    int acks = 0;
+  bool write_replicas(const std::string& key, std::vector<std::string> cmd) {
+    static constexpr int kMaxStale = 5;
     resp::Reply r;
-    for (size_t n : preference_list(key)) acks += call(n, cmd, r) && r.type != '-';
-    return acks >= w_;
+    for (int round = 0; round < kMaxStale; round++) {
+      cmd.back() = std::to_string(next_version());
+      int acks = 0;
+      bool stale = false;
+      for (size_t n : preference_list(key)) {
+        if (!call(n, cmd, r)) continue;
+        acks += r.type != '-';
+        if (r.type == '-' && r.str.compare(0, 6, "STALE ") == 0) {
+          stale = true;
+          const uint64_t seen = strtoull(r.str.c_str() + 6, nullptr, 10);
+          last_ver_ = std::max(last_ver_, (seen & ~uint64_t(0x3FF)) | id_);
+        }
+      }
+      if (!stale) return acks >= w_;
+    }
+    return false;
   }
 
   bool call(size_t i, const std::vector<std::string>& cmd, resp::Reply& r) {

@@ -1,8 +1,10 @@
 // kvserver: one cache node. Speaks a RESP2 subset, so redis-cli can talk to it:
 //   PING | GET k | SET k v [PX ms | PXAT unix-ms] [VER n] | DEL k [k ...] | DBSIZE | INFO
 // plus two commands for the cluster client's last-writer-wins replication:
-//   GETV k      -> *3 :version (0 = no entry), value or nil (tombstone), :expire_at or 0
+//   GETV k      -> *3 :version (0 = no entry or unversioned), value or nil, :expire_at or 0
 //   DELV k ver  -> stores a tombstone with that version for kTombGraceMs
+// A SET ... VER or DELV that loses to a newer version (or to a different write
+// with the same version) answers -STALE <that version> instead of +OK.
 // One thread per connection; storage is the sharded LRU in store.h with an
 // optional append-only log for durability.
 #include <arpa/inet.h>
@@ -25,7 +27,6 @@ static volatile sig_atomic_t g_stop = 0;
 constexpr size_t kMaxRequest = 64 << 20;  // caps bytes buffered for one unfinished command
 constexpr size_t kFlushAt = 64 << 10;     // send pipelined replies once this many pile up
 constexpr int kSendTimeoutSec = 10;       // drop a client that stops reading its replies
-constexpr int64_t kTombGraceMs = 600000;  // how long a delete is remembered (tombstone GC)
 
 static std::string upper(std::string s) {
   for (char& c : s) c = toupper(static_cast<unsigned char>(c));
@@ -38,6 +39,12 @@ static bool parse_num(const std::string& s, int64_t& out, size_t max_digits) {
     return false;
   out = std::stoll(s);
   return out > 0;
+}
+
+static void write_reply(std::string& out, bool fits, uint64_t newer) {
+  if (!fits) out += "-ERR entry too large for this node's --max-mb / --shards\r\n";
+  else if (newer) out += "-STALE " + std::to_string(newer) + "\r\n";
+  else out += "+OK\r\n";
 }
 
 static void execute(Store& store, std::vector<std::string>& a, std::string& out) {
@@ -72,13 +79,13 @@ static void execute(Store& store, std::vector<std::string>& a, std::string& out)
         return;
       }
     }
-    if (store.set(a[1], std::move(a[2]), at, true, ver)) out += "+OK\r\n";
-    else out += "-ERR value too large for this node's --max-mb / --shards\r\n";
+    uint64_t newer = 0;
+    write_reply(out, store.set(a[1], std::move(a[2]), at, true, ver, false, &newer), newer);
   } else if (cmd == "DELV" && n == 3) {
     int64_t ver = 0;
+    uint64_t newer = 0;
     if (!parse_num(a[2], ver, 18)) out += "-ERR invalid version\r\n";
-    else if (store.set(a[1], "", now_ms() + kTombGraceMs, true, ver, true)) out += "+OK\r\n";
-    else out += "-ERR key too large for this node's --max-mb / --shards\r\n";
+    else write_reply(out, store.set(a[1], "", now_ms() + kTombGraceMs, true, ver, true, &newer), newer);
   } else if (cmd == "DEL" && n >= 2) {
     int64_t removed = 0;
     for (size_t i = 1; i < n; i++) removed += store.del(a[i]);

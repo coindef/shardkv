@@ -279,6 +279,22 @@ static void test_aof() {
     s.attach_aof(nullptr);
     assert(s.stats().keys == 2 && s.stats().bytes <= 2 * 66);
   }
+
+  // A torn last record is a torn tail even when its value holds a whole
+  // CRC-valid record: that is data inside it, not an intact record after it.
+  unlink(path.c_str());
+  {
+    Store s;
+    Aof aof(path, 10);
+    s.attach_aof(&aof);
+    s.set("k0", "keep", 0);
+    s.set("k", std::string(200, 'A') + Aof::record({"SET", "x", "y"}) + std::string(200, 'B'), 0);
+  }
+  assert(stat(path.c_str(), &st) == 0 && truncate(path.c_str(), st.st_size - 100) == 0);
+  {
+    Store s;
+    assert(replay_into(s, path) == 1 && s.get("k0", &v) && !s.get("k", &v) && !s.get("x", &v));
+  }
   unlink(path.c_str());
 }
 
@@ -299,7 +315,14 @@ static void test_versions() {
   uint64_t ver = 0;
   s.set("k", "a", 0, true, 10);
   const off_t size = aof_size();
-  assert(s.set("k", "old", 0, true, 5) && s.set("k", "same", 0, true, 10));  // both ignored
+  // A write that lost reports the version that beat it, so the server can say
+  // -STALE instead of +OK: an older version, or a different value at the same
+  // version. The same write again (a retry, a read repair) is a silent no-op.
+  uint64_t newer = 0;
+  assert(s.set("k", "a", 0, true, 10, false, &newer) && newer == 0);
+  assert(s.set("k", "old", 0, true, 5, false, &newer) && newer == 10);
+  newer = 0;
+  assert(s.set("k", "same", 0, true, 10, false, &newer) && newer == 10);
   assert(s.get("k", &v, &ver) && v == "a" && ver == 10 && aof_size() == size);
   s.set("k", "", now_ms() + 60000, true, 11, true);  // tombstone
   assert(!s.get("k", &v, &ver) && ver == 11);
@@ -313,6 +336,19 @@ static void test_versions() {
   s.sweep();  // ...and the sweeper drops it, so any version applies again
   assert(s.set("gc", "x", 0, true, 1) && s.get("gc", &v, &ver) && v == "x" && ver == 1);
 
+  // A versioned value whose TTL runs out leaves a tombstone with its version,
+  // so a replica still holding an older version can't win a read and get it
+  // read-repaired back. Replay of the expired record does the same.
+  s.set("ttl", "new", now_ms() + 20, true, 20);
+  std::this_thread::sleep_for(50ms);
+  newer = 0;
+  assert(!s.get("ttl", &v, &ver) && ver == 20);
+  assert(s.set("ttl", "old", 0, true, 10, false, &newer) && newer == 20 && !s.get("ttl", &v));
+  assert(s.set("ttl", "newest", 0, true, 21) && s.get("ttl", &v) && v == "newest");
+  s.set("ttl2", "x", now_ms() + 20, true, 30);
+  std::this_thread::sleep_for(50ms);
+  assert(s.sweep() == 1 && !s.get("ttl2", &v, &ver) && ver == 30);
+
   s.set("k", "plain", 0);  // unversioned writes always apply
   assert(s.get("k", &v, &ver) && v == "plain" && ver == 0);
   s.set("t", "", now_ms() + 60000, true, 3, true);
@@ -321,7 +357,7 @@ static void test_versions() {
 
   Store r;
   replay_into(r, path);
-  for (const char* k : {"k", "gc", "t", "t2"}) {
+  for (const char* k : {"k", "gc", "t", "t2", "ttl", "ttl2"}) {
     std::string a, b;
     uint64_t va = 1, vb = 2;
     assert(s.get(k, &a, &va) == r.get(k, &b, &vb) && a == b && va == vb);
@@ -374,6 +410,13 @@ static void test_client() {
   bool threw = false;
   try {
     shardkv::Cluster({me, me});
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  assert(threw);
+  threw = false;
+  try {  // W=2 with one node can never be met: refuse it rather than clamp it
+    shardkv::Cluster({me}, 2, 10, 200, 2);
   } catch (const std::invalid_argument&) {
     threw = true;
   }

@@ -6,6 +6,7 @@ recovery + read repair of what the node missed, deletes included.
 Usage: integration_test.py [BIN_DIR]   (default: build)
 """
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -116,12 +117,14 @@ def test_protocol(port):
     assert call(port, "GET", "t") == "v"
     time.sleep(1.2)
     assert call(port, "GET", "t") is None
-    # last writer wins: an older version is ignored, a tombstone reads as a miss
+    # last writer wins: a write that loses says -STALE with the winning version
+    # (the same write again is a no-op), and a tombstone reads as a miss
     assert pipeline(port, [("SET", "w", "new", "VER", "20"), ("SET", "w", "old", "px", "9000", "VER", "10"),
-                           ("GETV", "w"), ("DELV", "w", "30"), ("GET", "w"), ("GETV", "w"),
+                           ("SET", "w", "new", "VER", "20"), ("SET", "w", "other", "VER", "20"),
+                           ("GETV", "w"), ("DELV", "w", "30"), ("DELV", "w", "25"), ("GET", "w"), ("GETV", "w"),
                            ("SET", "w", "x", "VER", "0"), ("DELV", "w", "-1")]) == \
-        ["OK", "OK", [20, "new", 0], "OK", None, [30, None, 0], "-ERR syntax error or invalid expire time",
-         "-ERR invalid version"]
+        ["OK", "-STALE 20", "OK", "-STALE 20", [20, "new", 0], "OK", "-STALE 30", None, [30, None, 0],
+         "-ERR syntax error or invalid expire time", "-ERR invalid version"]
     assert "keys:" in call(port, "INFO")
 
 
@@ -152,6 +155,8 @@ def main():
         print("all keys readable via failover with one node killed")
         upd, gone, last = list(owned)[:10], list(owned)[10:20], list(owned)[-1]
         assert kvcli(addrs, ["set %s new-%s" % (k, k) for k in upd] + ["del " + k for k in gone]) == ["OK"] * 20
+        ttl = list(owned)[21]  # the victim keeps the old value; the TTL'd overwrite must not let it back
+        assert kvcli(addrs, ["set %s short 200" % ttl]) == ["OK"]
         # W=2 can't be met with one of the key's two replicas down
         assert kvcli(addrs, ["set %s w2" % list(owned)[20]], "--write-quorum", "2")[0].startswith("ERR")
 
@@ -167,6 +172,22 @@ def main():
             assert pipeline(n.port, [("GET", k) for k in gone]) == [None] * 10
         assert call(victim.port, "GETV", gone[0])[0] > 0
         print("read repair brought the victim up to date: %d updates, %d deletes" % (len(upd), len(gone)))
+        time.sleep(0.3)  # the TTL has run out; its version must still beat the victim's old value
+        assert kvcli(addrs, ["get " + ttl]) == ["(nil)"]
+        for n in nodes:
+            assert call(n.port, "GET", ttl) is None
+        print("an expired overwrite kept the victim's older value from coming back")
+
+        # Another client's clock is a minute ahead: its write holds a higher
+        # version on every replica. A later write must move past it, not get
+        # +OK and be dropped.
+        ahead = (int(time.time() * 1000) + 60000) << 16
+        for n in nodes:
+            assert call(n.port, "SET", "lww", "theirs", "VER", ahead) == "OK"
+        assert kvcli(addrs, ["set lww mine", "get lww"], "--write-quorum", "2") == ["OK", "mine"]
+        held = [call(n.port, "GETV", "lww") for n in nodes]
+        assert sum(h[0] > ahead and h[1] == "mine" for h in held) == 2, held  # both replicas
+        print("a write after a newer-stamped one went past it on both replicas")
 
         r = subprocess.run([os.path.join(BIN, "kvbench"), "--nodes", addrs, "--threads", "4",
                             "--keys", "1000", "--duration", "1"],
@@ -181,6 +202,7 @@ def main():
         with open(n.log) as f:
             log = f.read()
         assert "Sanitizer" not in log and "runtime error" not in log, "sanitizer report, see " + n.log
+    shutil.rmtree(tmp)  # kept on failure: CI prints the node logs from it
     print("integration test: PASS")
 
 

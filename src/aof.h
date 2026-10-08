@@ -58,10 +58,11 @@ class Aof {
   Aof(const Aof&) = delete;
   Aof& operator=(const Aof&) = delete;
 
-  // Feeds every intact record to apply(). A bad record with nothing intact
-  // after it is what a crash mid-write leaves behind: the file is truncated
-  // there so new appends follow valid data. A bad record with intact records
-  // after it is corruption, and replay throws rather than drop them.
+  // Feeds every intact record to apply(). A crash mid-write leaves a bad
+  // record that is a strict prefix of one record, or has nothing intact after
+  // it: the file is truncated there so new appends follow valid data. Any
+  // other bad record is corruption, and replay throws rather than drop the
+  // intact records after it.
   // Returns the number of records applied.
   size_t replay(const std::function<void(std::vector<std::string>&)>& apply) {
     std::string data;  // ponytail: whole file in memory; stream it if AOFs outgrow RAM
@@ -82,7 +83,7 @@ class Aof {
       pos += 8 + len;
     }
     if (pos < data.size()) {
-      if (intact_record_after(data, pos + 1))
+      if (!torn_record(data, pos) && intact_record_after(data, pos + 1))
         throw std::runtime_error("aof: corrupt record at byte " + std::to_string(pos) +
                                  " with intact records after it; refusing to truncate");
       fprintf(stderr, "aof: dropping %zu bytes of torn tail\n", data.size() - pos);
@@ -142,6 +143,21 @@ class Aof {
   }
 
  private:
+  // Whether data[pos..] is the start of one record cut off by the end of the
+  // file: its length runs past EOF and its payload so far is an unfinished
+  // RESP command. Bytes inside that payload are a value, not records, even
+  // when the value holds a CRC-valid record.
+  static bool torn_record(const std::string& data, size_t pos) {
+    const size_t left = data.size() - pos;
+    if (left < 8) return true;
+    uint32_t len;
+    memcpy(&len, &data[pos], 4);
+    std::vector<std::string> args;
+    size_t used = 0;
+    return len > left - 8 &&
+           resp::parse_request(&data[pos + 8], left - 8, args, used) == resp::kIncomplete;
+  }
+
   // Whether a whole record with a matching CRC starts anywhere in data[from..].
   static bool intact_record_after(const std::string& data, size_t from) {
     for (size_t q = from; q + 8 <= data.size(); q++) {

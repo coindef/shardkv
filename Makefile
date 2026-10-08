@@ -2,7 +2,8 @@
 # `make tsan` rebuilds everything with ThreadSanitizer into build-tsan/ and
 # runs the same tests there, `make asan` does the same with AddressSanitizer +
 # UndefinedBehaviorSanitizer into build-asan/. `make bench` runs tests/bench.py.
-CXX      := clang++
+# clang++ when installed, else the system c++; override with make CXX=g++.
+CXX      := $(if $(shell command -v clang++ 2>/dev/null),clang++,c++)
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -pthread
 OUT      := build
 HDRS     := $(wildcard src/*.h)

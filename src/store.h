@@ -23,6 +23,8 @@ inline int64_t now_ms() {
   return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+constexpr int64_t kTombGraceMs = 600000;  // how long a delete is remembered (tombstone GC)
+
 class Store {
  public:
   struct Stats {
@@ -52,11 +54,7 @@ class Store {
     Shard& s = shard(key);
     std::lock_guard<std::mutex> lk(s.mu);
     auto it = s.map.find(key);
-    if (it != s.map.end() && dead(*it->second, now_ms())) {  // lazy expiry
-      remove(s, it->second);
-      s.expired++;
-      it = s.map.end();
-    }
+    if (it != s.map.end() && expire(s, it->second, now_ms())) it = s.map.end();  // lazy expiry
     if (ver) *ver = it == s.map.end() ? 0 : it->second->ver;
     if (it == s.map.end() || it->second->tomb) {
       s.misses++;
@@ -74,9 +72,11 @@ class Store {
   // for the key is dropped, as if the new one had been evicted at once.
   // ver > 0 makes it a last-writer-wins write: it is ignored (and not logged,
   // so replay stays exact) if the key holds a live entry, value or tombstone,
-  // with a version >= ver. ver 0 always applies. tomb stores a tombstone.
+  // with a version >= ver. Unless it was the same write again (equal version
+  // and value), *newer then gets the version that beat it. ver 0 always
+  // applies. tomb stores a tombstone.
   bool set(const std::string& key, std::string val, int64_t expire_at, bool evict = true,
-           uint64_t ver = 0, bool tomb = false) {
+           uint64_t ver = 0, bool tomb = false, uint64_t* newer = nullptr) {
     const bool fits = key.size() + val.size() + kOverhead <= shard_cap_;
     std::string log;  // encoded before taking the shard lock
     if (aof_ && fits) {
@@ -90,15 +90,20 @@ class Store {
     }
     Shard& s = shard(key);
     std::lock_guard<std::mutex> lk(s.mu);
+    const int64_t now = now_ms();
     auto it = s.map.find(key);
-    if (ver && it != s.map.end() && !dead(*it->second, now_ms()) && it->second->ver >= ver)
-      return true;  // stale or repeated: equal versions are ignored, so repair is idempotent
+    if (it != s.map.end() && expire(s, it->second, now)) it = s.map.end();
+    if (ver && it != s.map.end() && it->second->ver >= ver) {
+      const Entry& e = *it->second;  // a retry or repeated read repair is a no-op, not a loss
+      if (newer && (e.ver > ver || e.tomb != tomb || e.val != val)) *newer = e.ver;
+      return true;
+    }
     if (it != s.map.end()) remove(s, it->second);
-    // A deadline already in the past (e.g. replaying an old TTL) stores nothing.
-    if (fits && !(expire_at && expire_at <= now_ms())) {
+    if (fits) {
       s.lru.push_front(Entry{key, std::move(val), expire_at, ver, tomb});
       s.map.emplace(s.lru.front().key, s.lru.begin());
       s.bytes += cost(s.lru.front());
+      expire(s, s.lru.begin(), now);  // a deadline already in the past, e.g. an old TTL replayed
       if (evict) trim(s, log);
     }
     if (aof_) aof_->append(log);
@@ -114,9 +119,8 @@ class Store {
     std::lock_guard<std::mutex> lk(s.mu);
     if (aof_) aof_->append(log);
     auto it = s.map.find(key);
-    if (it == s.map.end()) return false;
-    const bool expired = dead(*it->second, now_ms()), live = !expired && !it->second->tomb;
-    s.expired += expired;
+    if (it == s.map.end() || expire(s, it->second, now_ms())) return false;
+    const bool live = !it->second->tomb;
     remove(s, it->second);
     return live;
   }
@@ -140,7 +144,8 @@ class Store {
     }
   }
 
-  // Drops all expired entries; the server runs this from a sweeper thread.
+  // Expires every entry past its deadline (see expire()); the server runs this
+  // from a sweeper thread. Returns how many expired.
   // ponytail: O(n) scan, one shard locked at a time; sample keys like Redis
   // does if keyspaces get large enough for the scan to hurt tail latency.
   size_t sweep() {
@@ -150,11 +155,8 @@ class Store {
       std::lock_guard<std::mutex> lk(s.mu);
       for (auto it = s.lru.begin(); it != s.lru.end();) {
         auto next = std::next(it);
-        if (dead(*it, now)) {
-          remove(s, it);
-          s.expired++;
-          n++;
-        }
+        n += dead(*it, now);
+        expire(s, it, now);
         it = next;
       }
     }
@@ -195,6 +197,23 @@ class Store {
   static constexpr size_t kOverhead = 64;
   static size_t cost(const Entry& e) { return e.key.size() + e.val.size() + kOverhead; }
   static bool dead(const Entry& e, int64_t now) { return e.expire_at && e.expire_at <= now; }
+  // Handles an entry past its deadline; true if it was removed. A versioned
+  // value becomes a tombstone that keeps its version for the grace period, or
+  // a replica still holding an older version would win the next read and read
+  // repair would copy that older value back here.
+  static bool expire(Shard& s, List::iterator e, int64_t now) {
+    if (!dead(*e, now)) return false;
+    s.expired++;
+    if (e->ver && !e->tomb && e->expire_at + kTombGraceMs > now) {
+      s.bytes -= e->val.size();
+      std::string().swap(e->val);
+      e->tomb = true;
+      e->expire_at += kTombGraceMs;
+      return false;
+    }
+    remove(s, e);
+    return true;
+  }
   Shard& shard(const std::string& key) {
     return shards_[std::hash<std::string>{}(key) % shards_.size()];
   }
@@ -204,8 +223,8 @@ class Store {
     while (s.bytes > shard_cap_) {
       auto victim = std::prev(s.lru.end());
       if (aof_) log += Aof::record({"DEL", victim->key});
+      (dead(*victim, now_ms()) ? s.expired : s.evictions)++;
       remove(s, victim);
-      s.evictions++;
     }
   }
   static void remove(Shard& s, List::iterator e) {
