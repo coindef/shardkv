@@ -1,6 +1,6 @@
 # ShardKV
 
-![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/coindef/shardkv/actions/workflows/ci.yml/badge.svg)](https://github.com/coindef/shardkv/actions/workflows/ci.yml) ![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A small distributed in-memory key-value cache in C++17: Redis-protocol server
 nodes with a lock-striped LRU store, TTLs, and an append-only log, plus a
@@ -402,9 +402,8 @@ this run, so there is no Redis comparison.
   upgrade path.
 - **AOF writes share one log.** Concurrent appends are batched into one
   `write()`, but each SET/DEL still waits for that write while it holds its
-  shard lock. On one node with 16 client threads doing only SETs, the AOF
-  costs about a quarter of the throughput (see the two single-node,
-  16-thread rows in Benchmarks).
+  shard lock, so write throughput drops with the AOF on. The Benchmarks
+  above run with the AOF off.
 - **The AOF is never compacted.** It grows with every write and every
   eviction, and replay time grows with it.
 - **Approximate memory accounting.** Each entry is charged its key and value

@@ -4,3 +4,5 @@ build-asan/
 *.aof
 __pycache__/
 .DS_Store
+*.dSYM/
+.review/
