@@ -122,12 +122,12 @@ def test_protocol(port):
     assert call(port, "GET", "t") is None
     # last writer wins: a write that loses says -STALE with the winning version
     # (the same write again is a no-op), and a tombstone reads as a miss
-    assert pipeline(port, [("SET", "w", "new", "VER", "20"), ("SET", "w", "old", "px", "9000", "VER", "10"),
+    got = pipeline(port, [("SET", "w", "new", "VER", "20"), ("SET", "w", "old", "px", "9000", "VER", "10"),
                            ("SET", "w", "new", "VER", "20"), ("SET", "w", "other", "VER", "20"),
                            ("GETV", "w"), ("DELV", "w", "30"), ("DELV", "w", "25"), ("GET", "w"), ("GETV", "w"),
-                           ("SET", "w", "x", "VER", "0"), ("DELV", "w", "-1")]) == \
-        ["OK", "-STALE 20", "OK", "-STALE 20", [20, "new", 0], "OK", "-STALE 30", None, [30, None, 0],
-         "-ERR syntax error or invalid expire time", "-ERR invalid version"]
+                           ("SET", "w", "x", "VER", "0"), ("DELV", "w", "-1")])
+    assert got == ["OK", "-STALE 20", "OK", "-STALE 20", [20, "new", 0], "OK", "-STALE 30", None, [30, None, 0],
+         "-ERR syntax error or invalid expire time", "-ERR invalid version"], got
     assert "keys:" in call(port, "INFO")
 
 
