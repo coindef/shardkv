@@ -17,15 +17,17 @@ libraries.
   p99, where every GET asks both replicas. Numbers are from `make bench` on
   an Apple M5; see [Benchmarks](#benchmarks).
 - **Replication:** consistent hashing with 100 virtual nodes per server
-  (about 1/N of the keys move when a node joins, checked in the tests), plus
+  (about 1/N of the stored copies move when a node joins), plus
   last-writer-wins versions, tombstones, and read repair, so a restarted
-  replica catches up and deleted keys stay deleted.
+  replica catches up on the keys that get read, and a delete beats a replica
+  that missed it if the key is read within the 10-minute tombstone grace
+  period.
 - **Storage:** a 16-way lock-striped O(1) LRU, and a CRC32-checked
   append-only log with torn-tail recovery, tested by truncating the log and
   by SIGKILLing a node.
 - **Testing:** ThreadSanitizer, AddressSanitizer + UBSan, and a seeded
-  randomized parser property test, run in GitHub Actions CI on Ubuntu and
-  macOS.
+  randomized parser property test, with a GitHub Actions workflow for
+  Ubuntu and macOS included.
 
 ## Design
 
@@ -109,8 +111,11 @@ libraries.
   nothing, so it is not logged. GETs are not logged, so replay cannot
   recompute LRU order. Instead it applies the logged evictions and
   never evicts on its own. That makes the replayed keyspace exactly what
-  was live at the crash, so a deleted key never comes back. If `--max-mb`
-  shrank between runs, the shards are trimmed once replay is done.
+  was live at the crash, so a deleted key never comes back. If the shard
+  budget shrank between runs (a smaller `--max-mb` or more `--shards`),
+  replay drops entries now too big for a shard and the shards are trimmed
+  once replay is done. Both are logged as DELs, so those keys stay gone if
+  the budget grows back.
   Expirations are not logged. They don't need to be, because deadlines are
   absolute and replay expires entries that are already dead the same way
   (a versioned value within its grace period comes back as its tombstone).
@@ -128,8 +133,9 @@ libraries.
 - **Placement.** Each server gets 100 virtual nodes on a 64-bit ring (FNV-1a
   plus the murmur3 finalizer). A key's preference list is the first R
   distinct servers clockwise from its hash. R defaults to 2. When a node is
-  added, only about 1/N of the keys move, and they all move to the new node.
-  The unit tests check this.
+  added, about 1/N of the stored copies move, all of them to the new node:
+  about 1/N of the keys get it as their primary and about R/N as one of
+  their replicas. The unit tests check the primaries.
 - **Versions.** The client stamps every write with a 64-bit version:
   `[unix ms:48][per-ms sequence:6][client id:10]`. The client id is random,
   and versions strictly increase per client. A client that writes more than
@@ -151,7 +157,9 @@ libraries.
 - **Deletes** write a tombstone with a new version (`DELV key ver`) instead
   of removing the key. Without it, a replica that missed the delete would
   still hold the old value, and read repair would copy it back. Tombstones
-  are kept for a 10-minute grace period and then garbage-collected.
+  are kept for a 10-minute grace period and then garbage-collected (a
+  tombstone that read repair copies to another replica starts a new grace
+  period there).
 - **Reads** ask all R replicas for `(version, value, expiry)` with `GETV`.
   A replica that fails or times out (default 500 ms) is skipped, and at
   least one must answer. The highest version wins. On a tie a value beats a
@@ -193,7 +201,8 @@ libraries.
 
 Requires clang++ or g++ (C++17), make, and python3. `make` uses clang++ when
 it is installed and the system `c++` otherwise; pick one with `make CXX=g++`.
-CI builds and tests on Ubuntu and macOS.
+Tested on macOS. `.github/workflows/ci.yml` is a GitHub Actions workflow that
+builds and tests on Ubuntu and macOS.
 
 ```sh
 make              # build/kvserver build/kvcli build/kvbench build/unit_test
@@ -232,8 +241,9 @@ the following:
 - LRU eviction order and oversized entries
 - lazy and active TTL expiry
 - AOF replay: a torn tail is truncated (also when the torn value holds a
-  valid record), mid-file corruption is refused, and replay after evictions
-  and a DEL of an evicted key gives back exactly the live keys
+  valid record), mid-file corruption is refused, replay after evictions
+  and a DEL of an evicted key gives back exactly the live keys, and an entry
+  too big for a shrunk budget stays gone when the budget grows back
 - last-writer-wins: an older version, or a different value at an equal
   version, is ignored, not logged, and reported as stale, while the same
   write repeated is a quiet no-op. A tombstone hides the key from GET and
@@ -282,7 +292,7 @@ redis-cli and every Redis client send. Inline commands are not supported.
 | `GETV key` | `*3` array: `:version` (0 = no entry or an unversioned value), the value or `$-1` (nil with a version > 0 is a tombstone, which is also what a versioned value becomes when its TTL runs out), `:expire_at` (unix ms; 0 = no TTL, and always 0 for nil) |
 | `DELV key ver` | `+OK`, or `-STALE ver` as for SET; stores a tombstone with that version for 10 minutes |
 | `DBSIZE` | `:n`, counting tombstones and expired keys the sweeper has not reached yet |
-| `INFO` / `STATS` | bulk string with `keys`, `used_bytes`, `hits`, `misses`, `evictions`, `expired` |
+| `INFO` / `STATS` | bulk string with `keys`, `used_bytes`, `hits`, `misses`, `evictions`, `expired` (values whose TTL ran out; tombstone GC isn't counted) |
 
 When the server gets malformed framing, it replies `-ERR Protocol error` and
 closes the connection, as Redis does. Unknown commands and wrong arity get an
@@ -325,13 +335,17 @@ this run, so there is no Redis comparison yet.
 
 - **Read repair only.** There is no anti-entropy (Merkle-tree sync) or
   hinted handoff, so a replica that missed writes catches up only on the
-  keys that get read. A key that is never read stays stale there. If a
-  replica that missed a delete (or a TTL'd overwrite) stays down longer than
-  the 10-minute tombstone grace period, or the other replica evicts the
-  tombstone, read repair copies the older value back (Cassandra's
-  `gc_grace_seconds` has the same trade-off). Eviction of a value is the
-  same: if the replica that took an overwrite evicts it, the older value on
-  a replica that missed the overwrite wins the next read.
+  keys that get read. A key that is never read stays stale there. That
+  includes deletes: if a replica missed a delete (or a TTL'd overwrite),
+  however briefly it was down, and the key is not read within the 10-minute
+  tombstone grace period after the delete (or the TTL deadline), the
+  tombstone is garbage-collected first. The next read then finds only the
+  older value, and read repair copies it back to every replica, so an
+  expired key can come back without its TTL. The same happens if the other replica evicts the tombstone
+  (Cassandra's `gc_grace_seconds` has the same trade-off, which is why it
+  needs repair within that window). Eviction of a value is the same: if the
+  replica that took an overwrite evicts it, the older value on a replica
+  that missed the overwrite wins the next read.
 - **LWW on client clocks.** Versions come from each client's clock. A write
   that finds a higher version on a replica moves past it, so with W = R no
   acknowledged write is lost. With W < R, a write can reach none of the

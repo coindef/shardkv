@@ -110,6 +110,9 @@ def test_protocol(port):
     assert call(port, "NOPE").startswith("-ERR")
     assert call(port, "GET").startswith("-ERR")
     assert call(port, "SET", "k", "v", "PX", "abc").startswith("-ERR")
+    # the longest PX makes a 16-digit deadline, which read repair sends back as PXAT
+    assert call(port, "SET", "far", "v", "PX", "9" * 15, "VER", "1") == "OK"
+    assert call(port, "SET", "far", "v", "PXAT", str(call(port, "GETV", "far")[2]), "VER", "2") == "OK"
     for junk in [b"hello\r\n", b"*-5\r\n", b"*1\r\n$3\r\nGETxx\r\n", b"*2\r\n$999999999999\r\n"]:
         assert send_raw(port, junk).startswith("-ERR"), junk
     assert call(port, "PING") == "PONG"  # still alive after the garbage

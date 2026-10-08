@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "aof.h"
@@ -39,6 +40,10 @@ class Store {
   // matches the in-memory order.
   void attach_aof(Aof* aof) {
     aof_ = aof;
+    std::string dels;  // entries replay dropped as too big for a shrunk budget stay gone
+    for (const std::string& k : dropped_) dels += Aof::record({"DEL", k});
+    if (aof_ && !dels.empty()) aof_->append(dels);
+    dropped_.clear();
     for (Shard& s : shards_) {  // replay doesn't evict: trim shards over a shrunk budget
       std::string log;
       std::lock_guard<std::mutex> lk(s.mu);
@@ -138,14 +143,17 @@ class Store {
         else if (cmd[i] == "VER") ver = strtoull(cmd[i + 1].c_str(), nullptr, 10);
         else if (cmd[i] == "TOMB") tomb = cmd[i + 1] == "1";
       }
-      set(cmd[1], std::move(cmd[2]), at, false, ver, tomb);
+      if (set(cmd[1], std::move(cmd[2]), at, false, ver, tomb)) dropped_.erase(cmd[1]);
+      else dropped_.insert(cmd[1]);  // too big for this budget: attach_aof logs the DEL
     } else if (cmd[0] == "DEL" && cmd.size() == 2) {
       del(cmd[1]);
+      dropped_.erase(cmd[1]);  // already gone in the log
     }
   }
 
   // Expires every entry past its deadline (see expire()); the server runs this
-  // from a sweeper thread. Returns how many expired.
+  // from a sweeper thread. Returns how many values expired (tombstone GC
+  // isn't counted, here or in Stats::expired).
   // ponytail: O(n) scan, one shard locked at a time; sample keys like Redis
   // does if keyspaces get large enough for the scan to hurt tail latency.
   size_t sweep() {
@@ -155,7 +163,7 @@ class Store {
       std::lock_guard<std::mutex> lk(s.mu);
       for (auto it = s.lru.begin(); it != s.lru.end();) {
         auto next = std::next(it);
-        n += dead(*it, now);
+        n += dead(*it, now) && !it->tomb;
         expire(s, it, now);
         it = next;
       }
@@ -203,7 +211,7 @@ class Store {
   // repair would copy that older value back here.
   static bool expire(Shard& s, List::iterator e, int64_t now) {
     if (!dead(*e, now)) return false;
-    s.expired++;
+    if (!e->tomb) s.expired++;  // a value's TTL ran out; a tombstone's GC isn't counted
     if (e->ver && !e->tomb && e->expire_at + kTombGraceMs > now) {
       s.bytes -= e->val.size();
       std::string().swap(e->val);
@@ -223,7 +231,8 @@ class Store {
     while (s.bytes > shard_cap_) {
       auto victim = std::prev(s.lru.end());
       if (aof_) log += Aof::record({"DEL", victim->key});
-      (dead(*victim, now_ms()) ? s.expired : s.evictions)++;
+      if (!dead(*victim, now_ms())) s.evictions++;
+      else if (!victim->tomb) s.expired++;
       remove(s, victim);
     }
   }
@@ -236,4 +245,5 @@ class Store {
   std::vector<Shard> shards_;
   size_t shard_cap_;
   Aof* aof_ = nullptr;
+  std::unordered_set<std::string> dropped_;  // replay only: keys whose last record didn't fit
 };

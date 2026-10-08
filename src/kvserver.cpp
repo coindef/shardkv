@@ -70,7 +70,7 @@ static void execute(Store& store, std::vector<std::string>& a, std::string& out)
     for (size_t i = 3; i < n; i += 2) {
       const std::string opt = upper(a[i]);
       int64_t v = 0;
-      const bool num = parse_num(a[i + 1], v, opt == "VER" ? 18 : 15);
+      const bool num = parse_num(a[i + 1], v, opt == "PX" ? 15 : 18);  // now + PX stays a valid PXAT
       if (num && opt == "PX") at = now_ms() + v;
       else if (num && opt == "PXAT") at = v;
       else if (num && opt == "VER") ver = v;

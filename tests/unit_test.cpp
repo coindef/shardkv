@@ -279,6 +279,27 @@ static void test_aof() {
     s.attach_aof(nullptr);
     assert(s.stats().keys == 2 && s.stats().bytes <= 2 * 66);
   }
+  // An entry too big for a shrunk budget is dropped by replay. attach logs that
+  // as a DEL (once), so the key stays gone when the budget grows back.
+  unlink(path.c_str());
+  {
+    Store s(1, 1 << 20);
+    Aof aof(path, 10);
+    s.attach_aof(&aof);
+    s.set("big", std::string(1000, 'x'), 0);
+    s.set("small", "s", 0);
+  }
+  for (size_t want : {2, 3, 3}) {
+    Store s(1, 500);
+    Aof aof(path, 10);
+    assert(aof.replay([&](Args& cmd) { s.apply(cmd); }) == want);
+    s.attach_aof(&aof);
+    assert(!s.get("big", &v) && s.get("small", &v));
+  }
+  {
+    Store s(1, 1 << 20);
+    assert(replay_into(s, path) == 3 && !s.get("big", &v) && s.get("small", &v));
+  }
 
   // A torn last record is a torn tail even when its value holds a whole
   // CRC-valid record: that is data inside it, not an intact record after it.
@@ -333,7 +354,10 @@ static void test_versions() {
 
   s.set("gc", "", now_ms() + 20, true, 7, true);  // its grace period runs out...
   std::this_thread::sleep_for(50ms);
-  s.sweep();  // ...and the sweeper drops it, so any version applies again
+  const uint64_t expired = s.stats().expired;
+  // ...the sweeper drops it (tombstone GC, not counted as an expiry), so any
+  // version applies again
+  assert(s.sweep() == 0 && s.stats().expired == expired);
   assert(s.set("gc", "x", 0, true, 1) && s.get("gc", &v, &ver) && v == "x" && ver == 1);
 
   // A versioned value whose TTL runs out leaves a tombstone with its version,
@@ -348,6 +372,7 @@ static void test_versions() {
   s.set("ttl2", "x", now_ms() + 20, true, 30);
   std::this_thread::sleep_for(50ms);
   assert(s.sweep() == 1 && !s.get("ttl2", &v, &ver) && ver == 30);
+  assert(s.stats().expired == expired + 2);  // ttl and ttl2, once each
 
   s.set("k", "plain", 0);  // unversioned writes always apply
   assert(s.get("k", &v, &ver) && v == "plain" && ver == 0);
