@@ -116,6 +116,7 @@ Requires clang++ (C++17), make, and python3. Builds on macOS and Linux.
 make              # build/kvserver build/kvcli build/kvbench build/unit_test
 make test         # unit tests + 3-node integration test
 make tsan         # same tests, everything built with -fsanitize=thread
+make asan         # same tests under -fsanitize=address,undefined
 ```
 
 ```sh

@@ -159,7 +159,8 @@ def main():
     for n in nodes:
         assert n.proc.returncode == 0, "kvserver exit code %s, see %s" % (n.proc.returncode, n.log)
         with open(n.log) as f:
-            assert "ThreadSanitizer" not in f.read(), "data race reported, see " + n.log
+            log = f.read()
+        assert "Sanitizer" not in log and "runtime error" not in log, "sanitizer report, see " + n.log
     print("integration test: PASS")
 
 
