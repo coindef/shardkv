@@ -9,6 +9,24 @@ replicates them with versioned last-writer-wins writes, tombstones, and read
 repair. It uses POSIX sockets and `std::thread` only, with no third-party
 libraries.
 
+## Highlights
+
+- **190k SET ops/s on one node** with 16 client threads (142k with the AOF
+  on). A single client (90% GET) sees a 14 µs p50 and 22 µs p99.
+- **92k ops/s on a 3-node cluster at R=2** (90% GET, AOF on) with a 125 µs
+  p99, where every GET asks both replicas. Numbers are from `make bench` on
+  an Apple M5; see [Benchmarks](#benchmarks).
+- **Replication:** consistent hashing with 100 virtual nodes per server
+  (about 1/N of the keys move when a node joins, checked in the tests), plus
+  last-writer-wins versions, tombstones, and read repair, so a restarted
+  replica catches up and deleted keys stay deleted.
+- **Storage:** a 16-way lock-striped O(1) LRU, and a CRC32-checked
+  append-only log with torn-tail recovery, tested by truncating the log and
+  by SIGKILLing a node.
+- **Testing:** ThreadSanitizer, AddressSanitizer + UBSan, and a seeded
+  randomized parser property test, run in GitHub Actions CI on Ubuntu and
+  macOS.
+
 ## Design
 
 ```
@@ -152,6 +170,7 @@ make              # build/kvserver build/kvcli build/kvbench build/unit_test
 make test         # unit tests + 3-node integration test
 make tsan         # same tests, everything built with -fsanitize=thread
 make asan         # same tests under -fsanitize=address,undefined
+make bench        # benchmark table for the README (about 2.5 min, not run in CI)
 ```
 
 ```sh
@@ -236,8 +255,33 @@ its replies is disconnected once a send makes no progress for 10 s.
 
 ## Benchmarks
 
-_TODO: measured numbers go here (hardware, node count, R, threads, value size,
-GET ratio, ops/s, p50/p95/p99)._
+Apple M5 (10 cores), macOS 26.2 arm64, 2026-10-08. Reproduce with
+`make bench` (`tests/bench.py`).
+
+| nodes | R | AOF | threads | GET % | ops/s | p50 µs | p99 µs |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 1 | 1 | on | 1 | 90 | 70986 | 14 | 22 |
+| 1 | 1 | on | 16 | 0 | 142159 | 99 | 294 |
+| 1 | 1 | off | 16 | 0 | 189534 | 83 | 113 |
+| 3 | 2 | on | 8 | 90 | 92225 | 84 | 125 |
+| 3 | 2 | off | 8 | 90 | 94499 | 83 | 118 |
+| 3 | 2 | on | 8 | 0 | 73856 | 105 | 169 |
+| 3 | 2 | off | 8 | 0 | 94351 | 83 | 117 |
+| 3 | 1 | on | 8 | 90 | 182288 | 42 | 70 |
+
+**Method.** Each row starts fresh nodes and prefills 10,000 keys with
+100 B values. It then runs `kvbench` 3 times for 5 s each and shows the
+run with the median throughput, with that run's p50 and p99. kvbench is
+closed-loop: each thread sends its next request when the previous one
+returns. The client and the servers run on the same machine and share its
+cores, so these numbers measure the code path, not a network. Expect about
+±10% between runs. A GET at R=2 asks both replicas, one after the other,
+which is why the R=1 row does about twice the ops/s. AOF on means the
+default `--fsync-ms 1000`.
+
+`make bench` also compares one kvserver with one redis-server using
+`redis-benchmark` when both are installed. They were not installed for
+this run, so there is no Redis comparison yet.
 
 ## Limitations
 
@@ -263,8 +307,8 @@ GET ratio, ops/s, p50/p95/p99)._
 - **AOF writes share one log.** Concurrent appends are batched into one
   `write()`, but each SET/DEL still waits for that write while it holds its
   shard lock. On one node with 16 client threads doing only SETs, the AOF
-  costs about a quarter of the throughput: about 145k ops/s with it and
-  190k without. Before batching it was 120k.
+  costs about a quarter of the throughput (see the two single-node,
+  16-thread rows in Benchmarks).
 - **The AOF is never compacted.** It grows with every write and every
   eviction, and replay time grows with it.
 - **Approximate memory accounting.** Each entry is charged its key and value
