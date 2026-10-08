@@ -79,13 +79,19 @@ static void execute(Store& store, std::vector<std::string>& a, std::string& out)
         return;
       }
     }
+    // set() fills `newer`, so call it before reading `newer`: the order in which
+    // function arguments are evaluated is unspecified (GCC goes right to left).
     uint64_t newer = 0;
-    write_reply(out, store.set(a[1], std::move(a[2]), at, true, ver, false, &newer), newer);
+    const bool fits = store.set(a[1], std::move(a[2]), at, true, ver, false, &newer);
+    write_reply(out, fits, newer);
   } else if (cmd == "DELV" && n == 3) {
     int64_t ver = 0;
     uint64_t newer = 0;
     if (!parse_num(a[2], ver, 18)) out += "-ERR invalid version\r\n";
-    else write_reply(out, store.set(a[1], "", now_ms() + kTombGraceMs, true, ver, true, &newer), newer);
+    else {
+      const bool fits = store.set(a[1], "", now_ms() + kTombGraceMs, true, ver, true, &newer);
+      write_reply(out, fits, newer);
+    }
   } else if (cmd == "DEL" && n >= 2) {
     int64_t removed = 0;
     for (size_t i = 1; i < n; i++) removed += store.del(a[i]);
