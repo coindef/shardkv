@@ -1,5 +1,7 @@
 # ShardKV
 
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A small distributed in-memory key-value cache in C++17: Redis-protocol server
 nodes with a lock-striped LRU store, TTLs, and an append-only log, plus a
 client library that spreads keys over the nodes with consistent hashing and
@@ -110,7 +112,7 @@ libraries.
 
 ## Build, run, test
 
-Requires clang++ (C++17), make, and python3. Builds on macOS and Linux.
+Requires clang++ or g++ (C++17), make, and python3. CI builds and tests on Ubuntu and macOS.
 
 ```sh
 make              # build/kvserver build/kvcli build/kvbench build/unit_test

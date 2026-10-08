@@ -1,0 +1,23 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    name: ${{ matrix.os }} ${{ matrix.target }} ${{ matrix.cxx }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        target: [test, tsan, asan]
+        cxx: [clang++]
+        include:
+          - {os: ubuntu-latest, target: test, cxx: g++}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ${{ matrix.cxx }} --version
+      - if: runner.os == 'Linux'
+        run: sudo sysctl vm.mmap_rnd_bits=28   # TSan 'unexpected memory mapping' on high-ASLR runner kernels
+      - run: make ${{ matrix.target }} CXX=${{ matrix.cxx }}
+      - if: failure()
+        run: cat "${TMPDIR:-/tmp}"/shardkv_it_*/*.log || true

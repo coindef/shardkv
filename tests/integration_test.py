@@ -109,9 +109,9 @@ def test_protocol(port):
     for junk in [b"hello\r\n", b"*-5\r\n", b"*1\r\n$3\r\nGETxx\r\n", b"*2\r\n$999999999999\r\n"]:
         assert send_raw(port, junk).startswith("-ERR"), junk
     assert call(port, "PING") == "PONG"  # still alive after the garbage
-    assert call(port, "SET", "t", "v", "PX", "100") == "OK"
+    assert call(port, "SET", "t", "v", "PX", "1000") == "OK"  # wide: TSan on a shared CI runner
     assert call(port, "GET", "t") == "v"
-    time.sleep(0.3)
+    time.sleep(1.2)
     assert call(port, "GET", "t") is None
     assert "keys:" in call(port, "INFO")
 

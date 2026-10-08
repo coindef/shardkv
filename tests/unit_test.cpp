@@ -153,11 +153,11 @@ static void test_lru() {
 static void test_ttl() {
   Store s(4, 1 << 20);
   std::string v;
-  s.set("short", "x", now_ms() + 50);
+  s.set("short", "x", now_ms() + 300);  // wide: TSan on a shared CI runner
   s.set("long", "y", now_ms() + 60000);
   s.set("forever", "z", 0);
   assert(s.get("short", &v) && v == "x");
-  std::this_thread::sleep_for(80ms);
+  std::this_thread::sleep_for(400ms);
   assert(!s.get("short", &v));  // lazy expiry on access
   assert(s.get("long", &v) && s.get("forever", &v));
   assert(s.stats().expired == 1);
