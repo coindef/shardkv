@@ -35,8 +35,9 @@ struct Cursor {
   }
   Status line(std::string& out) {
     const char* cr = static_cast<const char*>(memchr(p + i, '\r', n - i));
-    if (!cr) return n - i > kMaxLine ? kError : kIncomplete;
-    size_t e = cr - p;
+    const size_t e = cr ? size_t(cr - p) : n;
+    if (e - i > kMaxLine) return kError;  // same limit whether or not the CR has arrived
+    if (!cr) return kIncomplete;
     if (e + 1 >= n) return kIncomplete;
     if (p[e + 1] != '\n') return kError;
     out.assign(p + i, e - i);

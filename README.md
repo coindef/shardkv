@@ -136,6 +136,12 @@ Server flags: `--port 6380 --bind 127.0.0.1 --aof FILE --fsync-ms 1000 --max-mb 
 **What the tests cover.** `tests/unit_test.cpp` uses plain asserts. It covers
 the following:
 - the RESP parser on every partial prefix and on malformed input
+- a seeded randomized parser test: encode/parse round trips; streams fed in
+  random 1-17 byte chunks through the same loop as the server, which must
+  give back the same commands; and randomly mutated streams, where every
+  prefix must stay `kIncomplete` until the first `kOk` or `kError` and then
+  keep that answer. It found a reply line over 1024 bytes that parsed `kOk`
+  when it arrived whole and `kError` when split before its CR
 - LRU eviction order and oversized entries
 - lazy and active TTL expiry
 - AOF replay: a torn tail is truncated, mid-file corruption is refused, and

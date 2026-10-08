@@ -45,6 +45,91 @@ static void test_resp() {
   assert(reply("?\r\n") == resp::kError);
 }
 
+// serve() relies on two parser guarantees: the answer doesn't depend on how TCP
+// splits the bytes, and the parser never reads past the buffer. Each prefix is
+// copied into an exact-size heap block, so ASan flags any over-read.
+static void test_resp_random() {
+  using namespace std::string_literals;
+  std::mt19937 rng(12345);  // fixed seed: deterministic runs
+  const std::string alphabet = "\r\n\0$*:+-0123456789ab"s;
+  auto pick = [&](size_t lo, size_t hi) { return lo + rng() % (hi - lo + 1); };
+  auto command = [&] {
+    Args a(pick(1, 4));
+    for (auto& s : a)
+      for (size_t k = pick(0, 12); k--;) s += alphabet[rng() % alphabet.size()];
+    return a;
+  };
+  auto stream = [&](std::vector<Args>& cmds) {
+    std::string s;
+    for (size_t k = pick(1, 4); k--;) s += resp::encode(cmds.emplace_back(command()));
+    return s;
+  };
+  Args args;
+  resp::Reply r;
+  size_t used = 0;
+  auto req = [&](const char* p, size_t n, size_t& u) { return resp::parse_request(p, n, args, u); };
+  auto rep = [&](const char* p, size_t n, size_t& u) { return resp::parse_reply(p, n, r, u); };
+  // As bytes arrive the status goes kIncomplete -> kOk or kError once, then stays.
+  auto check_prefixes = [&](const std::string& buf, auto parse) {
+    resp::Status first = resp::kIncomplete;
+    size_t first_used = 0;
+    for (size_t L = 0; L <= buf.size(); L++) {
+      const std::vector<char> b(buf.begin(), buf.begin() + L);
+      size_t u = 0;
+      const resp::Status st = parse(b.data(), L, u);
+      if (first == resp::kIncomplete) {
+        first = st, first_used = u;
+        assert(st != resp::kOk || u <= L);
+      } else {
+        assert(st == first && (st != resp::kOk || u == first_used));
+      }
+    }
+  };
+
+  for (int it = 0; it < 2000; it++) {  // (a) round trip
+    const Args a = command();
+    const std::string s = resp::encode(a);
+    assert(resp::parse_request(s.data(), s.size(), args, used) == resp::kOk && used == s.size() &&
+           args == a);
+  }
+  for (int it = 0; it < 2000; it++) {  // (b) serve()'s loop, fed in random 1..17 byte chunks
+    std::vector<Args> cmds, got;
+    const std::string s = stream(cmds);
+    std::string in;
+    for (size_t off = 0; off < s.size();) {
+      const size_t k = std::min(pick(1, 17), s.size() - off);
+      in.append(s, off, k);
+      off += k;
+      size_t pos = 0;
+      resp::Status st;
+      while ((st = resp::parse_request(in.data() + pos, in.size() - pos, args, used)) == resp::kOk) {
+        got.push_back(args);
+        pos += used;
+      }
+      assert(st == resp::kIncomplete);
+      in.erase(0, pos);
+    }
+    assert(got == cmds && in.empty());
+  }
+  for (int it = 0; it < 3000; it++) {  // (c) mutated streams: overwrite, insert or delete a byte
+    std::vector<Args> cmds;
+    std::string s = stream(cmds);
+    for (size_t m = pick(1, 3); m--;) {
+      const size_t at = rng() % s.size();
+      const char c = alphabet[rng() % alphabet.size()];
+      switch (rng() % 3) {
+        case 0: s[at] = c; break;
+        case 1: s.insert(s.begin() + at, c); break;
+        default: s.erase(at, 1);
+      }
+    }
+    check_prefixes(s, req);
+    check_prefixes(s, rep);
+  }
+  for (int it = 0; it < 50; it++)  // (d) a reply line near kMaxLine, split before its CR or not
+    check_prefixes((it % 2 ? "+" : "-") + std::string(pick(1000, 1100), 'x') + "\r\n", rep);
+}
+
 static void test_lru() {
   Store s(1, 3 * 66);  // one shard with room for exactly three 1-byte keys/values
   std::string v;
@@ -302,6 +387,7 @@ static void test_concurrent() {
 
 int main() {
   test_resp();
+  test_resp_random();
   test_lru();
   test_ttl();
   test_aof();
