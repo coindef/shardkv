@@ -1,5 +1,6 @@
-// Unit tests (plain asserts): RESP codec, LRU eviction, TTL expiry, AOF replay
-// and torn-tail recovery, hash-ring placement, client failover backoff, and a
+// Unit tests (plain asserts): RESP codec (plus a randomized property test), LRU
+// eviction, TTL expiry, AOF replay and torn-tail recovery, last-writer-wins
+// versions and tombstones, hash-ring placement, client failover backoff, and a
 // concurrent smoke test that gives ThreadSanitizer something to chew on.
 #undef NDEBUG
 #include <sys/stat.h>
@@ -43,6 +44,12 @@ static void test_resp() {
   assert(reply("$5\r\nhello\r\n") == resp::kOk && r.str == "hello" && used == 11);
   assert(reply("$5\r\nhel") == resp::kIncomplete);
   assert(reply("?\r\n") == resp::kError);
+  const std::string arr = "*3\r\n:5\r\n$1\r\nv\r\n:0\r\n";  // a GETV reply
+  assert(reply(arr) == resp::kOk && used == arr.size() && r.elems.size() == 3 &&
+         r.elems[0].num == 5 && r.elems[1].str == "v" && r.elems[2].num == 0);
+  for (size_t i = 0; i < arr.size(); i++)
+    assert(resp::parse_reply(arr.data(), i, r, used) == resp::kIncomplete);
+  assert(reply("*1\r\n*0\r\n") == resp::kError);  // no nested arrays
 }
 
 // serve() relies on two parser guarantees: the answer doesn't depend on how TCP
@@ -275,6 +282,53 @@ static void test_aof() {
   unlink(path.c_str());
 }
 
+// Last-writer-wins: a versioned write loses to a live entry (value or
+// tombstone) with a version >= its own, and a losing write isn't logged.
+static void test_versions() {
+  const std::string path = tmp_path("versions");
+  unlink(path.c_str());
+  auto aof_size = [&] {
+    struct stat st;
+    assert(stat(path.c_str(), &st) == 0);
+    return st.st_size;
+  };
+  Store s;
+  Aof aof(path, 10);
+  s.attach_aof(&aof);
+  std::string v;
+  uint64_t ver = 0;
+  s.set("k", "a", 0, true, 10);
+  const off_t size = aof_size();
+  assert(s.set("k", "old", 0, true, 5) && s.set("k", "same", 0, true, 10));  // both ignored
+  assert(s.get("k", &v, &ver) && v == "a" && ver == 10 && aof_size() == size);
+  s.set("k", "", now_ms() + 60000, true, 11, true);  // tombstone
+  assert(!s.get("k", &v, &ver) && ver == 11);
+  s.set("k", "older", 0, true, 9);
+  assert(!s.get("k", &v, &ver) && ver == 11);
+  s.set("k", "b", 0, true, 12);
+  assert(s.get("k", &v, &ver) && v == "b" && ver == 12);
+
+  s.set("gc", "", now_ms() + 20, true, 7, true);  // its grace period runs out...
+  std::this_thread::sleep_for(50ms);
+  s.sweep();  // ...and the sweeper drops it, so any version applies again
+  assert(s.set("gc", "x", 0, true, 1) && s.get("gc", &v, &ver) && v == "x" && ver == 1);
+
+  s.set("k", "plain", 0);  // unversioned writes always apply
+  assert(s.get("k", &v, &ver) && v == "plain" && ver == 0);
+  s.set("t", "", now_ms() + 60000, true, 3, true);
+  assert(!s.del("t") && !s.get("t", &v, &ver) && ver == 0);  // removed, but not a live key
+  s.set("t2", "", now_ms() + 60000, true, 4, true);
+
+  Store r;
+  replay_into(r, path);
+  for (const char* k : {"k", "gc", "t", "t2"}) {
+    std::string a, b;
+    uint64_t va = 1, vb = 2;
+    assert(s.get(k, &a, &va) == r.get(k, &b, &vb) && a == b && va == vb);
+  }
+  unlink(path.c_str());
+}
+
 static void test_ring() {
   const std::vector<std::string> three = {"10.0.0.1:7000", "10.0.0.2:7000", "10.0.0.3:7000"};
   std::vector<std::string> four = three;
@@ -356,12 +410,15 @@ static void test_concurrent() {
     ts.emplace_back([&, t] {
       std::mt19937 rng(t);
       std::string v;
+      uint64_t ver;
       for (int i = 0; i < 20000; i++) {
         const std::string k = "k" + std::to_string(rng() % 500);
-        switch (rng() % 3) {
+        switch (rng() % 5) {
           case 0: s.set(k, "value", rng() % 2 ? 0 : now_ms() + 1); break;
           case 1: s.get(k, &v), gets++; break;
-          default: s.del(k);
+          case 2: s.del(k); break;
+          case 3: ver = rng() % 50 + 1, s.set(k, "v" + std::to_string(ver), 0, true, ver); break;
+          default: s.set(k, "", now_ms() + 60000, true, rng() % 50 + 1, true);  // tombstone
         }
       }
     });
@@ -380,7 +437,8 @@ static void test_concurrent() {
   for (int i = 0; i < 500; i++) {
     const std::string k = "k" + std::to_string(i);
     std::string a, b;
-    assert(s.get(k, &a) == r.get(k, &b) && a == b);
+    uint64_t va = 1, vb = 2;
+    assert(s.get(k, &a, &va) == r.get(k, &b, &vb) && a == b && va == vb);
   }
   unlink(path.c_str());
 }
@@ -391,6 +449,7 @@ int main() {
   test_lru();
   test_ttl();
   test_aof();
+  test_versions();
   test_ring();
   test_client();
   test_concurrent();

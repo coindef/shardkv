@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test: raw protocol edge cases, a 3-node cluster written through
-kvcli, SIGKILL of one node with failover reads, then restart + AOF recovery.
+kvcli, SIGKILL of one node with failover reads and writes, then restart + AOF
+recovery + read repair of what the node missed, deletes included.
 
 Usage: integration_test.py [BIN_DIR]   (default: build)
 """
@@ -31,10 +32,12 @@ def encode(*args):
 
 
 def read_reply(f):
-    """'+OK' -> 'OK', '-ERR x' -> '-ERR x', ':5' -> 5, '$..' -> str or None."""
+    """'+OK' -> 'OK', '-ERR x' -> '-ERR x', ':5' -> 5, '$..' -> str or None, '*..' -> list."""
     line = f.readline()
     assert line.endswith(b"\r\n"), "connection closed or bad reply: %r" % line
     kind, body = line[:1], line[1:-2].decode()
+    if kind == b"*":
+        return [read_reply(f) for _ in range(int(body))]
     if kind == b"$":
         n = int(body)
         return None if n < 0 else f.read(n + 2)[:-2].decode()
@@ -63,8 +66,8 @@ def send_raw(port, *chunks):
         return read_reply(s.makefile("rb"))
 
 
-def kvcli(nodes, lines):
-    r = subprocess.run([os.path.join(BIN, "kvcli"), "--nodes", nodes],
+def kvcli(nodes, lines, *flags):
+    r = subprocess.run([os.path.join(BIN, "kvcli"), "--nodes", nodes, *flags],
                        input="\n".join(lines) + "\n", capture_output=True, text=True, timeout=120)
     return r.stdout.splitlines()
 
@@ -113,6 +116,12 @@ def test_protocol(port):
     assert call(port, "GET", "t") == "v"
     time.sleep(1.2)
     assert call(port, "GET", "t") is None
+    # last writer wins: an older version is ignored, a tombstone reads as a miss
+    assert pipeline(port, [("SET", "w", "new", "VER", "20"), ("SET", "w", "old", "px", "9000", "VER", "10"),
+                           ("GETV", "w"), ("DELV", "w", "30"), ("GET", "w"), ("GETV", "w"),
+                           ("SET", "w", "x", "VER", "0"), ("DELV", "w", "-1")]) == \
+        ["OK", "OK", [20, "new", 0], "OK", None, [30, None, 0], "-ERR syntax error or invalid expire time",
+         "-ERR invalid version"]
     assert "keys:" in call(port, "INFO")
 
 
@@ -141,12 +150,23 @@ def main():
         assert kvcli(addrs, ["get " + k for k in keys]) == list(keys.values())
         assert kvcli(addrs, ["set outage yes", "get outage"]) == ["OK", "yes"]
         print("all keys readable via failover with one node killed")
+        upd, gone, last = list(owned)[:10], list(owned)[10:20], list(owned)[-1]
+        assert kvcli(addrs, ["set %s new-%s" % (k, k) for k in upd] + ["del " + k for k in gone]) == ["OK"] * 20
+        # W=2 can't be met with one of the key's two replicas down
+        assert kvcli(addrs, ["set %s w2" % list(owned)[20]], "--write-quorum", "2")[0].startswith("ERR")
 
         victim.start()
         assert call(victim.port, "DBSIZE") == len(owned)
-        assert pipeline(victim.port, [("GET", k) for k in owned]) == list(owned.values())
-        assert kvcli(addrs, ["set back again", "get back", "get key7"]) == ["OK", "again", "val7"]
+        assert pipeline(victim.port, [("GET", k) for k in owned]) == list(owned.values())  # stale
+        assert kvcli(addrs, ["set back again", "get back", "get " + last]) == ["OK", "again", owned[last]]
         print("restarted node recovered %d keys from its AOF" % len(owned))
+        # Reads ask both replicas, return the newest version and repair the victim.
+        assert kvcli(addrs, ["get " + k for k in upd + gone]) == ["new-" + k for k in upd] + ["(nil)"] * 10
+        assert pipeline(victim.port, [("GET", k) for k in upd + gone]) == ["new-" + k for k in upd] + [None] * 10
+        for n in nodes:  # the tombstones keep the deleted keys from coming back
+            assert pipeline(n.port, [("GET", k) for k in gone]) == [None] * 10
+        assert call(victim.port, "GETV", gone[0])[0] > 0
+        print("read repair brought the victim up to date: %d updates, %d deletes" % (len(upd), len(gone)))
 
         r = subprocess.run([os.path.join(BIN, "kvbench"), "--nodes", addrs, "--threads", "4",
                             "--keys", "1000", "--duration", "1"],

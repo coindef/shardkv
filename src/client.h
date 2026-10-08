@@ -2,9 +2,12 @@
 // Header-only ShardKV cluster client.
 // Keys are placed on a consistent-hash ring with virtual nodes; each key lives
 // on the first R distinct nodes clockwise from its hash (its preference list).
-//   writes: sent to all R replicas, succeed if at least one acks (W=1)
-//   reads:  the first replica that answers wins; on a connect/IO error or
-//           timeout the next replica in the list is tried (failover)
+//   writes: stamped with a new version and sent to all R replicas; succeed if
+//           at least W ack (default 1). A delete writes a versioned tombstone.
+//           Replicas keep the highest version they see (last writer wins).
+//   reads:  ask every replica for its version (GETV), skipping any that fail
+//           or time out, and return the newest. Replicas that answered with
+//           an older version get the newest one written back (read repair).
 // A Cluster keeps one connection per node and is NOT thread-safe: use one
 // Cluster per thread.
 #include <fcntl.h>
@@ -21,6 +24,7 @@
 #include <csignal>
 #include <cstdint>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -41,6 +45,11 @@ inline uint64_t hash64(const std::string& s) {
   h ^= h >> 33;
   h *= 0xc4ceb9fe1a85ec53ULL;
   return h ^ (h >> 33);
+}
+
+inline int64_t wall_ms() {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
 inline std::vector<std::string> split(const std::string& s, char sep) {
@@ -135,12 +144,13 @@ class Conn {
 
 class Cluster {
  public:
-  // addrs: "host:port" per node.
+  // addrs: "host:port" per node. write_quorum (W) is clamped to 1..R.
   explicit Cluster(const std::vector<std::string>& addrs, int replicas = 2, int vnodes = 100,
-                   int timeout_ms = 500)
+                   int timeout_ms = 500, int write_quorum = 1)
       : nodes_(addrs.size()), timeout_ms_(timeout_ms) {
     if (addrs.empty()) throw std::invalid_argument("no nodes given");
     replicas_ = std::min<size_t>(std::max(replicas, 1), addrs.size());
+    w_ = std::clamp(write_quorum, 1, int(replicas_));
     signal(SIGPIPE, SIG_IGN);  // a dead peer should be an EPIPE error, not kill us
     for (size_t i = 0; i < addrs.size(); i++) {
       size_t colon = addrs[i].rfind(':');
@@ -167,25 +177,53 @@ class Cluster {
     return out;
   }
 
-  // The value, or nullopt if the key does not exist. Throws if no replica
-  // answers. Every call throws std::invalid_argument for a key or value over
-  // the server's 16 MB limit, which the server would answer by hanging up.
+  // The newest value, or nullopt if the newest entry is a delete or there is
+  // none. Throws if no replica answers. Every call throws
+  // std::invalid_argument for a key or value over the server's 16 MB limit,
+  // which the server would answer by hanging up.
   std::optional<std::string> get(const std::string& key) {
+    struct Answer {
+      size_t node;
+      uint64_t ver;  // 0 = no entry
+      resp::Reply r;
+    };
+    std::vector<Answer> got;
     resp::Reply r;
     for (size_t n : preference_list(key))
-      if (call(n, {"GET", key}, r) && r.type == '$')
-        return r.nil ? std::nullopt : std::optional<std::string>(std::move(r.str));
-    throw std::runtime_error("GET " + key + ": no replica reachable");
+      if (call(n, {"GETV", key}, r) && r.type == '*' && r.elems.size() == 3)
+        got.push_back({n, uint64_t(r.elems[0].num), std::move(r)});
+    if (got.empty()) throw std::runtime_error("GET " + key + ": no replica reachable");
+    // max_element keeps the first of equal versions: ties go to preference order.
+    const Answer& win = *std::max_element(
+        got.begin(), got.end(), [](const Answer& a, const Answer& b) { return a.ver < b.ver; });
+    const resp::Reply& val = win.r.elems[1];
+    const std::string ver = std::to_string(win.ver);
+    std::vector<std::string> fix{"DELV", key, ver};  // newest is a tombstone
+    if (!val.nil) {
+      const long long at = win.r.elems[2].num;
+      fix = {"SET", key, val.str};
+      if (at > 0) fix.insert(fix.end(), {"PXAT", std::to_string(at)});
+      fix.insert(fix.end(), {"VER", ver});
+    }
+    for (const Answer& a : got)  // read repair, best effort: failures are ignored
+      if (a.ver < win.ver) call(a.node, fix, r);
+    if (val.nil) return std::nullopt;
+    return val.str;
   }
 
-  // True if at least one replica acked. ttl_ms <= 0 means no expiry.
+  // True if at least W replicas acked. ttl_ms <= 0 means no expiry.
   bool set(const std::string& key, const std::string& val, int64_t ttl_ms = 0) {
     std::vector<std::string> cmd{"SET", key, val};
     if (ttl_ms > 0) cmd.insert(cmd.end(), {"PX", std::to_string(ttl_ms)});
+    cmd.insert(cmd.end(), {"VER", std::to_string(next_version())});
     return write_replicas(key, cmd);
   }
 
-  bool del(const std::string& key) { return write_replicas(key, {"DEL", key}); }
+  // Writes a tombstone, so a replica that missed the delete can't bring the
+  // key back through read repair. True if at least W replicas acked.
+  bool del(const std::string& key) {
+    return write_replicas(key, {"DELV", key, std::to_string(next_version())});
+  }
 
  private:
   struct Node {
@@ -194,13 +232,19 @@ class Cluster {
     std::chrono::steady_clock::time_point retry_at;  // skip the node until then
   };
 
-  // ponytail: replicas are written one after another; pipeline the fan-out if
-  // write latency matters.
+  // [unix ms:48][per-ms sequence:6][client id:10]. Strictly increasing per
+  // client; more than 64 writes in one ms borrow from the next ms.
+  uint64_t next_version() {
+    return last_ver_ = std::max(uint64_t(wall_ms()) << 16 | id_, last_ver_ + (1u << 10));
+  }
+
+  // ponytail: replicas are written (and read) one after another; pipeline the
+  // fan-out if latency matters.
   bool write_replicas(const std::string& key, const std::vector<std::string>& cmd) {
     int acks = 0;
     resp::Reply r;
     for (size_t n : preference_list(key)) acks += call(n, cmd, r) && r.type != '-';
-    return acks > 0;
+    return acks >= w_;
   }
 
   bool call(size_t i, const std::vector<std::string>& cmd, resp::Reply& r) {
@@ -225,7 +269,8 @@ class Cluster {
   std::vector<Node> nodes_;
   std::vector<std::pair<uint64_t, size_t>> ring_;  // (vnode hash, node index), sorted
   size_t replicas_;
-  int timeout_ms_;
+  int timeout_ms_, w_;
+  uint64_t id_ = std::random_device{}() & 0x3FF, last_ver_ = 0;
 };
 
 }  // namespace shardkv

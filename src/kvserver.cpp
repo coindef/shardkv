@@ -1,5 +1,8 @@
 // kvserver: one cache node. Speaks a RESP2 subset, so redis-cli can talk to it:
-//   PING | GET k | SET k v [PX ms | PXAT unix-ms] | DEL k [k ...] | DBSIZE | INFO
+//   PING | GET k | SET k v [PX ms | PXAT unix-ms] [VER n] | DEL k [k ...] | DBSIZE | INFO
+// plus two commands for the cluster client's last-writer-wins replication:
+//   GETV k      -> *3 :version (0 = no entry), value or nil (tombstone), :expire_at or 0
+//   DELV k ver  -> stores a tombstone with that version for kTombGraceMs
 // One thread per connection; storage is the sharded LRU in store.h with an
 // optional append-only log for durability.
 #include <arpa/inet.h>
@@ -22,15 +25,16 @@ static volatile sig_atomic_t g_stop = 0;
 constexpr size_t kMaxRequest = 64 << 20;  // caps bytes buffered for one unfinished command
 constexpr size_t kFlushAt = 64 << 10;     // send pipelined replies once this many pile up
 constexpr int kSendTimeoutSec = 10;       // drop a client that stops reading its replies
+constexpr int64_t kTombGraceMs = 600000;  // how long a delete is remembered (tombstone GC)
 
 static std::string upper(std::string s) {
   for (char& c : s) c = toupper(static_cast<unsigned char>(c));
   return s;
 }
 
-// Strict positive integer: digits only, no sign, no overflow.
-static bool parse_ms(const std::string& s, int64_t& out) {
-  if (s.empty() || s.size() > 15 || s.find_first_not_of("0123456789") != std::string::npos)
+// Strict positive integer: digits only, no sign, at most max_digits (so no overflow).
+static bool parse_num(const std::string& s, int64_t& out, size_t max_digits) {
+  if (s.empty() || s.size() > max_digits || s.find_first_not_of("0123456789") != std::string::npos)
     return false;
   out = std::stoll(s);
   return out > 0;
@@ -45,18 +49,36 @@ static void execute(Store& store, std::vector<std::string>& a, std::string& out)
     std::string v;
     if (store.get(a[1], &v)) resp::append_bulk(out, v);
     else out += "$-1\r\n";
-  } else if (cmd == "SET" && (n == 3 || n == 5)) {
-    int64_t at = 0, ms = 0;
-    if (n == 5) {
-      const std::string opt = upper(a[3]);
-      if ((opt != "PX" && opt != "PXAT") || !parse_ms(a[4], ms)) {
+  } else if (cmd == "GETV" && n == 2) {
+    std::string v;
+    uint64_t ver = 0;
+    int64_t at = 0;
+    const bool hit = store.get(a[1], &v, &ver, &at);
+    out += "*3\r\n:" + std::to_string(ver) + "\r\n";
+    if (hit) resp::append_bulk(out, v);
+    else out += "$-1\r\n";
+    out += ":" + std::to_string(at) + "\r\n";  // stays 0 on a miss
+  } else if (cmd == "SET" && (n == 3 || n == 5 || n == 7)) {
+    int64_t at = 0, ver = 0;
+    for (size_t i = 3; i < n; i += 2) {
+      const std::string opt = upper(a[i]);
+      int64_t v = 0;
+      const bool num = parse_num(a[i + 1], v, opt == "VER" ? 18 : 15);
+      if (num && opt == "PX") at = now_ms() + v;
+      else if (num && opt == "PXAT") at = v;
+      else if (num && opt == "VER") ver = v;
+      else {
         out += "-ERR syntax error or invalid expire time\r\n";
         return;
       }
-      at = opt == "PX" ? now_ms() + ms : ms;
     }
-    if (store.set(a[1], std::move(a[2]), at)) out += "+OK\r\n";
+    if (store.set(a[1], std::move(a[2]), at, true, ver)) out += "+OK\r\n";
     else out += "-ERR value too large for this node's --max-mb / --shards\r\n";
+  } else if (cmd == "DELV" && n == 3) {
+    int64_t ver = 0;
+    if (!parse_num(a[2], ver, 18)) out += "-ERR invalid version\r\n";
+    else if (store.set(a[1], "", now_ms() + kTombGraceMs, true, ver, true)) out += "+OK\r\n";
+    else out += "-ERR key too large for this node's --max-mb / --shards\r\n";
   } else if (cmd == "DEL" && n >= 2) {
     int64_t removed = 0;
     for (size_t i = 1; i < n; i++) removed += store.del(a[i]);

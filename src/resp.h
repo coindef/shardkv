@@ -1,6 +1,7 @@
 #pragma once
 // Minimal RESP2 codec (the Redis wire protocol). Requests are arrays of bulk
-// strings; replies are simple strings, errors, integers or bulk strings.
+// strings; replies are simple strings, errors, integers, bulk strings, or
+// flat arrays of those.
 // Parsers never consume partial input: on a short buffer they return
 // kIncomplete and the caller retries once more bytes have arrived.
 #include <unistd.h>
@@ -19,10 +20,11 @@ constexpr size_t kMaxBulk = 16 << 20;  // largest key/value accepted
 constexpr size_t kMaxLine = 1024;      // longest header or simple-string line
 
 struct Reply {
-  char type = 0;  // '+', '-', ':' or '$'
+  char type = 0;  // '+', '-', ':', '$' or '*'
   std::string str;
-  long long num = 0;
+  long long num = 0;  // ':' value, or '*' element count
   bool nil = false;
+  std::vector<Reply> elems;  // '*' only
 };
 
 struct Cursor {
@@ -96,6 +98,16 @@ inline Status parse_reply(const char* buf, size_t len, Reply& r, size_t& used) {
   if (r.type == '+' || r.type == '-') st = c.line(r.str);
   else if (r.type == ':') st = c.integer(r.num);
   else if (r.type == '$') st = c.bulk(r.str, r.nil);
+  else if (r.type == '*' && (st = c.integer(r.num)) == kOk) {
+    if (r.num < 0 || size_t(r.num) > kMaxArgs) return kError;
+    r.elems.resize(r.num);
+    for (Reply& e : r.elems) {  // no nested arrays, so recursion is at most 1 deep
+      size_t u = 0;
+      if (c.i < len && buf[c.i] == '*') return kError;
+      if ((st = parse_reply(buf + c.i, len - c.i, e, u)) != kOk) return st;
+      c.i += u;
+    }
+  }
   if (st == kOk) used = c.i;
   return st;
 }

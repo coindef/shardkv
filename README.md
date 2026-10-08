@@ -5,7 +5,8 @@
 A small distributed in-memory key-value cache in C++17: Redis-protocol server
 nodes with a lock-striped LRU store, TTLs, and an append-only log, plus a
 client library that spreads keys over the nodes with consistent hashing and
-replication. It uses POSIX sockets and `std::thread` only, with no third-party
+replicates them with versioned last-writer-wins writes, tombstones, and read
+repair. It uses POSIX sockets and `std::thread` only, with no third-party
 libraries.
 
 ## Design
@@ -16,6 +17,8 @@ libraries.
         client.h: shardkv::Cluster
         hash ring, 100 virtual nodes per server
         key -> preference list = first R distinct nodes clockwise
+        writes: versioned SET / DELV to all R, ok if >= W ack
+        reads:  GETV from all R, newest version wins, stale ones repaired
           |                  |                  |
    +--------------+   +--------------+   +--------------+
    | kvserver :A  |   | kvserver :B  |   | kvserver :C  |
@@ -37,10 +40,10 @@ libraries.
 | File | What it does |
 |------|--------------|
 | `src/resp.h` | RESP2 encoder/parser. The parser never consumes a partial frame and reports `kIncomplete` |
-| `src/store.h` | Sharded LRU with TTL, lazy and active expiry, and stats |
+| `src/store.h` | Sharded LRU with TTL, lazy and active expiry, versions and tombstones, and stats |
 | `src/aof.h` | Append-only log with CRC'd records, batched writes, periodic fsync, and torn-tail recovery |
 | `src/kvserver.cpp` | TCP server and command dispatch |
-| `src/client.h` | Header-only cluster client: hash ring, replication, failover, reconnect |
+| `src/client.h` | Header-only cluster client: hash ring, versioned replication, write quorum, read repair, reconnect |
 | `src/kvcli.cpp` | CLI built on the client library |
 | `src/kvbench.cpp` | Multithreaded load generator that reports ops/s and p50/p95/p99 |
 
@@ -59,10 +62,17 @@ libraries.
 - **TTL.** Each entry holds an absolute wall-clock expiry time. Reads expire
   keys lazily, and a sweeper thread scans for expired keys once per second.
   Because expiry times are absolute, they still hold after an AOF replay.
+- **Versions and tombstones.** An entry can carry a version (0 means
+  unversioned). A versioned write is ignored if the key holds a live entry
+  with an equal or higher version. A tombstone is an entry with no value
+  that records a versioned delete. GET treats it as a miss, but it still
+  counts in `DBSIZE`, uses LRU budget, and can be evicted. Every tombstone
+  expires 10 minutes after it is written (the grace period), and the normal
+  expiry path then removes it. That is the tombstone GC.
 
 ### Durability (AOF)
 - Record format: `[u32 len][u32 crc32][payload]`. The payload is the command
-  encoded as a RESP array (`SET k v [PXAT ms]` or `DEL k`).
+  encoded as a RESP array (`SET k v [PXAT ms] [VER n] [TOMB 1]` or `DEL k`).
 - A write is acknowledged only after its record has been `write()`n to the
   file, so a process crash (SIGKILL) loses no acknowledged write. Appends
   that arrive while a `write()` is in flight queue up, and the next one
@@ -72,9 +82,11 @@ libraries.
   window. A failed write or sync stops the server rather than keep acking.
 - The log append happens inside the shard lock. This keeps the log order for
   each key the same as the in-memory order.
-- **What is logged.** Every SET, every DEL (even of a key that is no longer
-  in memory), and every eviction (as a DEL). GETs are not logged, so replay
-  cannot recompute LRU order. Instead it applies the logged evictions and
+- **What is logged.** Every SET, every DELV (as a SET with `TOMB 1`), every
+  DEL (even of a key that is no longer in memory), and every eviction (as a
+  DEL). A versioned write that loses to an equal or newer version changed
+  nothing, so it is not logged. GETs are not logged, so replay cannot
+  recompute LRU order. Instead it applies the logged evictions and
   never evicts on its own. That makes the replayed keyspace exactly what
   was live at the crash, so a deleted key never comes back. If `--max-mb`
   shrank between runs, the shards are trimmed once replay is done.
@@ -93,19 +105,40 @@ libraries.
   distinct servers clockwise from its hash. R defaults to 2. When a node is
   added, only about 1/N of the keys move, and they all move to the new node.
   The unit tests check this.
-- **Writes** go to all R replicas one after another and succeed if at least
-  one acks (W=1).
-- **Reads** try the preference list in order. A replica that answers wins,
-  whether with a hit or a miss. On a connect/IO error or timeout (default
-  500 ms), the client fails over to the next replica.
+- **Versions.** The client stamps every write with a 64-bit version:
+  `[unix ms:48][per-ms sequence:6][client id:10]`. The client id is random,
+  and versions strictly increase per client. Each replica keeps the highest
+  version it has seen (last writer wins, LWW) and ignores an older or equal
+  one, which still gets `+OK`.
+- **Writes** (`SET ... VER n`) go to all R replicas one after another and
+  succeed if at least W ack. W defaults to 1 (`--write-quorum` in kvcli).
+- **Deletes** write a tombstone with a new version (`DELV key ver`) instead
+  of removing the key. Without it, a replica that missed the delete would
+  still hold the old value, and read repair would copy it back. Tombstones
+  are kept for a 10-minute grace period and then garbage-collected.
+- **Reads** ask all R replicas for `(version, value, expiry)` with `GETV`.
+  A replica that fails or times out (default 500 ms) is skipped, and at
+  least one must answer. The highest version wins, and ties go to the
+  earliest replica in the preference list. A tombstone or no entry reads as
+  a miss.
+- **Read repair.** Each replica that answered with a lower version gets the
+  winner written back (`SET key val [PXAT at] VER v`, or `DELV key v` for a
+  tombstone). This is best effort: failures are ignored. Because equal
+  versions are ignored, repeating a repair changes nothing.
+- **Unversioned writes** (plain `SET` / `DEL` from redis-cli, or AOF records
+  written before versions existed) always apply and store version 0. Any
+  versioned entry beats them during read repair.
+- **Eviction is local, deletion is global.** An LRU eviction removes the key
+  from that node only and never creates a tombstone.
 - **Reconnect.** A failed node is skipped for 1 s after the failure, then
   retried with a fresh connection. A pooled connection that went stale (for
   example because the node restarted) gets one immediate retry on a new
   socket.
-- This is **best-effort replication: W=1, first responder wins on reads,
-  and replicas are not guaranteed to converge**. Each replica keeps whatever
-  it last received. Concurrent writers, or a node that missed writes while
-  it was down, can leave replicas with different values (see Limitations).
+- **Read-your-writes.** A read needs only one replica to answer, so its
+  read quorum is 1. In Dynamo's terms (read quorum + W > replicas) reads are
+  guaranteed to see the latest acknowledged write when W = R. With W=1, a
+  read returns an older value only if every replica that took the write is
+  unreachable at that moment.
 - The client throws `std::invalid_argument` for a key or value over 16 MB
   instead of sending it, because the server would hang up on it. It also
   throws for a node that is listed twice.
@@ -129,6 +162,8 @@ N=127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
 build/kvcli --nodes $N set user:1 alice
 build/kvcli --nodes $N get user:1
 build/kvcli --nodes $N set session:9 xyz 5000   # TTL in ms
+build/kvcli --nodes $N del user:1               # writes a tombstone on both replicas
+build/kvcli --nodes $N --write-quorum 2 set user:2 bob   # fails unless both replicas ack
 build/kvbench --nodes $N --threads 8 --keys 100000 --value-size 100 --get-ratio 0.9 --duration 10
 redis-cli -p 7001 info                          # any single node speaks RESP
 ```
@@ -137,7 +172,8 @@ Server flags: `--port 6380 --bind 127.0.0.1 --aof FILE --fsync-ms 1000 --max-mb 
 
 **What the tests cover.** `tests/unit_test.cpp` uses plain asserts. It covers
 the following:
-- the RESP parser on every partial prefix and on malformed input
+- the RESP parser on every partial prefix and on malformed input, and
+  array replies (no nesting)
 - a seeded randomized parser test: encode/parse round trips; streams fed in
   random 1-17 byte chunks through the same loop as the server, which must
   give back the same commands; and randomly mutated streams, where every
@@ -149,19 +185,31 @@ the following:
 - AOF replay: a torn tail is truncated, mid-file corruption is refused, and
   replay after evictions and a DEL of an evicted key gives back exactly the
   live keys
+- last-writer-wins: older and equal versions are ignored and not logged, a
+  tombstone hides the key from GET and blocks older writes until its grace
+  period ends and the sweeper drops it, unversioned writes always apply, and
+  AOF replay restores every key's value and version
 - the balance and minimal key movement of the hash ring
 - client failover backoff against a node that hangs
-- an 8-thread stress test of the store with the AOF on, checking that
-  replaying its log reproduces the live store
+- an 8-thread stress test of the store with the AOF on, mixing plain,
+  versioned and tombstone writes, checking that replaying its log
+  reproduces the live store, versions included
 
 `tests/integration_test.py` does the following:
 1. Starts 3 nodes.
-2. Checks pipelining, partial reads, and malformed input on the raw protocol.
+2. Checks pipelining, partial reads, malformed input, and `SET ... VER` /
+   `GETV` / `DELV` on the raw protocol.
 3. Writes 300 keys through `kvcli` and checks that each key is on exactly 2
    nodes.
-4. `SIGKILL`s one node and reads every key back through failover.
-5. Restarts that node and checks that AOF replay restored exactly its keys.
-6. Runs a short `kvbench`.
+4. `SIGKILL`s one node and reads every key back through failover. While it
+   is down, updates 10 of its keys and deletes 10 more, and checks that a
+   `--write-quorum 2` write fails.
+5. Restarts that node and checks that AOF replay restored exactly its keys,
+   which are now stale.
+6. Reads the updated and deleted keys through `kvcli`, then checks that read
+   repair brought the restarted node up to date, that no node returns a
+   deleted key, and that the node holds the tombstone.
+7. Runs a short `kvbench`.
 
 ## Protocol
 
@@ -172,9 +220,11 @@ redis-cli and every Redis client send. Inline commands are not supported.
 |---------|-------|
 | `PING` | `+PONG` |
 | `GET key` | bulk string or `$-1` (nil) |
-| `SET key value [PX ms \| PXAT unix-ms]` | `+OK` |
-| `DEL key [key ...]` | `:n` keys removed |
-| `DBSIZE` | `:n` (may include expired keys the sweeper has not reached yet) |
+| `SET key value [PX ms \| PXAT unix-ms] [VER n]` | `+OK`, also when a `VER` write loses to an equal or newer version and is ignored |
+| `DEL key [key ...]` | `:n` keys removed (a tombstone is removed but not counted) |
+| `GETV key` | `*3` array: `:version` (0 = no entry), the value or `$-1` (nil with a version > 0 is a tombstone), `:expire_at` (unix ms, 0 = none) |
+| `DELV key ver` | `+OK`; stores a tombstone with that version for 10 minutes |
+| `DBSIZE` | `:n`, counting tombstones and expired keys the sweeper has not reached yet |
 | `INFO` / `STATS` | bulk string with `keys`, `used_bytes`, `hits`, `misses`, `evictions`, `expired` |
 
 When the server gets malformed framing, it replies `-ERR Protocol error` and
@@ -191,13 +241,19 @@ GET ratio, ops/s, p50/p95/p99)._
 
 ## Limitations
 
-- **No anti-entropy or read repair.** A replica that missed writes while it
-  was down never catches up on its own. After it restarts it can serve stale
-  values or false misses for those keys, because reads stop at the first
-  replica that answers.
-- **W=1 writes, with no quorum, versioning, or conflict resolution.**
-  Concurrent writers can leave replicas permanently different, and a write
-  that reached only a node that later loses its disk is gone.
+- **Read repair only.** There is no anti-entropy (Merkle-tree sync) or
+  hinted handoff, so a replica that missed writes catches up only on the
+  keys that get read. A key that is never read stays stale there. If a
+  replica that missed a delete stays down longer than the 10-minute
+  tombstone grace period, or the other replica evicts the tombstone, read
+  repair copies the deleted value back (Cassandra's `gc_grace_seconds` has
+  the same trade-off).
+- **LWW on client wall clocks.** Versions come from each client's clock, so
+  clock skew between clients can let an older write win. Hybrid logical
+  clocks are the upgrade path. A write that fails its W quorum is not rolled
+  back: the replicas that took it keep it, and a later read can return it.
+  Reads are guaranteed to see the latest acknowledged write only when W = R
+  (see Read-your-writes above).
 - **Static membership.** The node list is fixed when the client is created.
   There is no rebalancing or data migration when nodes join or leave.
 - **Thread per connection.** This is simple, but it will not scale past a
@@ -216,5 +272,6 @@ GET ratio, ops/s, p50/p95/p99)._
 - **The sweeper scans the whole keyspace** once per second, one shard at a
   time. Redis-style random sampling would be better for very large
   keyspaces.
-- **Replica writes are sequential.** Write latency is about R round trips.
+- **Replica reads and writes are sequential.** Each GET and each SET/DEL
+  costs about R round trips.
 - **No auth or TLS.** The server binds to 127.0.0.1 by default.

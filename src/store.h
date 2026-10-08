@@ -3,7 +3,8 @@
 // shard has its own mutex, so threads touching different shards don't contend
 // on the store (with an AOF, writes still share its log; see Aof::append).
 // Each shard is an O(1) LRU: a list ordered by recency plus a hash map from
-// key to list node.
+// key to list node. Entries can carry a version for last-writer-wins
+// replication, and a tombstone is an entry that records a versioned delete.
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -44,7 +45,10 @@ class Store {
     }
   }
 
-  bool get(const std::string& key, std::string* val) {
+  // True only for a live value. *ver gets the entry's version, value or
+  // tombstone (0 if there is no entry), *expire_at the value's deadline.
+  bool get(const std::string& key, std::string* val, uint64_t* ver = nullptr,
+           int64_t* expire_at = nullptr) {
     Shard& s = shard(key);
     std::lock_guard<std::mutex> lk(s.mu);
     auto it = s.map.find(key);
@@ -53,35 +57,46 @@ class Store {
       s.expired++;
       it = s.map.end();
     }
-    if (it == s.map.end()) {
+    if (ver) *ver = it == s.map.end() ? 0 : it->second->ver;
+    if (it == s.map.end() || it->second->tomb) {
       s.misses++;
       return false;
     }
     s.lru.splice(s.lru.begin(), s.lru, it->second);  // now most recently used
     s.hits++;
     *val = it->second->val;
+    if (expire_at) *expire_at = it->second->expire_at;
     return true;
   }
 
   // expire_at: absolute unix time in ms, 0 = never. Returns false if the entry
   // alone is bigger than a shard's budget: it is not stored, and any old value
   // for the key is dropped, as if the new one had been evicted at once.
-  bool set(const std::string& key, std::string val, int64_t expire_at, bool evict = true) {
+  // ver > 0 makes it a last-writer-wins write: it is ignored (and not logged,
+  // so replay stays exact) if the key holds a live entry, value or tombstone,
+  // with a version >= ver. ver 0 always applies. tomb stores a tombstone.
+  bool set(const std::string& key, std::string val, int64_t expire_at, bool evict = true,
+           uint64_t ver = 0, bool tomb = false) {
     const bool fits = key.size() + val.size() + kOverhead <= shard_cap_;
     std::string log;  // encoded before taking the shard lock
     if (aof_ && fits) {
       std::vector<std::string> rec{"SET", key, val};
       if (expire_at) rec.insert(rec.end(), {"PXAT", std::to_string(expire_at)});
+      if (ver) rec.insert(rec.end(), {"VER", std::to_string(ver)});
+      if (tomb) rec.insert(rec.end(), {"TOMB", "1"});
       log = Aof::record(rec);
     } else if (aof_) {
       log = Aof::record({"DEL", key});
     }
     Shard& s = shard(key);
     std::lock_guard<std::mutex> lk(s.mu);
-    if (auto it = s.map.find(key); it != s.map.end()) remove(s, it->second);
+    auto it = s.map.find(key);
+    if (ver && it != s.map.end() && !dead(*it->second, now_ms()) && it->second->ver >= ver)
+      return true;  // stale or repeated: equal versions are ignored, so repair is idempotent
+    if (it != s.map.end()) remove(s, it->second);
     // A deadline already in the past (e.g. replaying an old TTL) stores nothing.
     if (fits && !(expire_at && expire_at <= now_ms())) {
-      s.lru.push_front(Entry{key, std::move(val), expire_at});
+      s.lru.push_front(Entry{key, std::move(val), expire_at, ver, tomb});
       s.map.emplace(s.lru.front().key, s.lru.begin());
       s.bytes += cost(s.lru.front());
       if (evict) trim(s, log);
@@ -90,8 +105,9 @@ class Store {
     return fits;
   }
 
-  // True if a live key was removed. The DEL is logged even when the key isn't
-  // in memory, so no older SET in the log can bring it back on replay.
+  // True if a live value was removed (a tombstone doesn't count). The DEL is
+  // logged even when the key isn't in memory, so no older SET in the log can
+  // bring it back on replay.
   bool del(const std::string& key) {
     const std::string log = aof_ ? Aof::record({"DEL", key}) : "";
     Shard& s = shard(key);
@@ -99,8 +115,8 @@ class Store {
     if (aof_) aof_->append(log);
     auto it = s.map.find(key);
     if (it == s.map.end()) return false;
-    bool live = !dead(*it->second, now_ms());
-    if (!live) s.expired++;
+    const bool expired = dead(*it->second, now_ms()), live = !expired && !it->second->tomb;
+    s.expired += expired;
     remove(s, it->second);
     return live;
   }
@@ -109,11 +125,19 @@ class Store {
   // Evictions are in the log as DELs, so replay must not pick its own victims:
   // GETs aren't logged, so its LRU order differs from the live server's.
   void apply(std::vector<std::string>& cmd) {
-    if (cmd[0] == "SET" && cmd.size() >= 3)
-      set(cmd[1], std::move(cmd[2]), cmd.size() == 5 ? strtoll(cmd[4].c_str(), nullptr, 10) : 0,
-          false);
-    else if (cmd[0] == "DEL" && cmd.size() == 2)
+    if (cmd[0] == "SET" && cmd.size() >= 3) {
+      int64_t at = 0;
+      uint64_t ver = 0;
+      bool tomb = false;
+      for (size_t i = 3; i + 1 < cmd.size(); i += 2) {  // option pairs; unknown ones are skipped
+        if (cmd[i] == "PXAT") at = strtoll(cmd[i + 1].c_str(), nullptr, 10);
+        else if (cmd[i] == "VER") ver = strtoull(cmd[i + 1].c_str(), nullptr, 10);
+        else if (cmd[i] == "TOMB") tomb = cmd[i + 1] == "1";
+      }
+      set(cmd[1], std::move(cmd[2]), at, false, ver, tomb);
+    } else if (cmd[0] == "DEL" && cmd.size() == 2) {
       del(cmd[1]);
+    }
   }
 
   // Drops all expired entries; the server runs this from a sweeper thread.
@@ -155,6 +179,8 @@ class Store {
   struct Entry {
     std::string key, val;
     int64_t expire_at;
+    uint64_t ver = 0;   // 0 = unversioned
+    bool tomb = false;  // a delete marker: GET misses; always has an expire_at
   };
   using List = std::list<Entry>;
   struct Shard {
